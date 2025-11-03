@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fitsSystemWindows="true">
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <com.google.android.material.tabs.TabLayout
+            android:id="@+id/tabLayout"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            app:tabIndicatorFullWidth="false"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:padding="8dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Model:"
+                android:paddingEnd="8dp"/>
+
+            <Spinner
+                android:id="@+id/spModel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"/>
+        </LinearLayout>
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1">
+
+            <!-- Вкладка LIVE -->
+            <FrameLayout
+                android:id="@+id/liveContainer"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent">
+
+                <androidx.camera.view.PreviewView
+                    android:id="@+id/preview"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:keepScreenOn="true" />
+
+                <com.example.testyolo.OverlayView
+                    android:id="@+id/overlay"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:clickable="false" />
+
+                <TextView
+                    android:id="@+id/hud"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_gravity="top|end"
+                    android:padding="8dp"
+                    android:textColor="@android:color/white"
+                    android:background="#66000000"
+                    android:text="-- fps" />
+            </FrameLayout>
+
+            <!-- Вкладка LOG -->
+            <LinearLayout
+                android:id="@+id/logContainer"
+                android:visibility="gone"
+                android:orientation="vertical"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:padding="8dp"
+                    android:gravity="end">
+                    <Button
+                        android:id="@+id/btnClearLog"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="Очистить"/>
+                </LinearLayout>
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/rvLog"
+                    android:layout_width="match_parent"
+                    android:layout_height="0dp"
+                    android:layout_weight="1"/>
+            </LinearLayout>
+
+        </FrameLayout>
+    </LinearLayout>
+</FrameLayout>
