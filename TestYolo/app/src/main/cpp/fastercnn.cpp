@@ -80,6 +80,8 @@ static void parse_param_io(AAssetManager* mgr,
 
 class FasterRCNN {
 public:
+    void clear() { net.clear(); }
+
     bool load(AAssetManager* mgr, const char* param, const char* bin) {
         mgr_ = mgr;
         param_asset_ = param ? param : "";

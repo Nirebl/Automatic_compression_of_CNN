@@ -15,7 +15,9 @@ static std::string J2S(JNIEnv* env, jstring js) {
 }
 
 extern "C" {
-
+JNIEXPORT void JNICALL
+Java_com_example_testyolo_MainActivity_00024ResNetBridge_release(
+        JNIEnv*, jobject) { g_resnet.clear(); }
 // boolean init(AssetManager, String param, String bin)
 JNIEXPORT jboolean JNICALL
 Java_com_example_testyolo_MainActivity_00024ResNetBridge_init(

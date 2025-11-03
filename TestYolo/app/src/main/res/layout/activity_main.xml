@@ -4,18 +4,22 @@
     android:id="@+id/root"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:clipChildren="true"
+    android:clipToPadding="true"
     android:fitsSystemWindows="true">
 
     <LinearLayout
-        android:orientation="vertical"
         android:layout_width="match_parent"
-        android:layout_height="match_parent">
+        android:layout_height="match_parent"
+        android:clipChildren="true"
+        android:clipToPadding="true"
+        android:orientation="vertical">
 
         <com.google.android.material.tabs.TabLayout
             android:id="@+id/tabLayout"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            app:tabIndicatorFullWidth="false"/>
+            app:tabIndicatorFullWidth="false" />
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -26,31 +30,37 @@
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="Model:"
-                android:paddingEnd="8dp"/>
+                android:paddingEnd="8dp"
+                android:text="Model:" />
 
             <Spinner
                 android:id="@+id/spModel"
                 android:layout_width="wrap_content"
-                android:layout_height="wrap_content"/>
+                android:layout_height="wrap_content" />
         </LinearLayout>
 
         <FrameLayout
             android:layout_width="match_parent"
             android:layout_height="0dp"
-            android:layout_weight="1">
+            android:layout_weight="1"
+            android:clipChildren="true"
+            android:clipToPadding="true">
 
             <!-- Вкладка LIVE -->
             <FrameLayout
                 android:id="@+id/liveContainer"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent">
+                android:layout_height="match_parent"
+                android:clipChildren="true"
+                android:clipToPadding="true">
 
                 <androidx.camera.view.PreviewView
                     android:id="@+id/preview"
                     android:layout_width="match_parent"
                     android:layout_height="match_parent"
-                    android:keepScreenOn="true" />
+                    android:keepScreenOn="true"
+                    app:implementationMode="compatible"
+                    app:scaleType="fillCenter" />
 
                 <com.example.testyolo.OverlayView
                     android:id="@+id/overlay"
@@ -63,37 +73,38 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_gravity="top|end"
-                    android:padding="8dp"
-                    android:textColor="@android:color/white"
                     android:background="#66000000"
-                    android:text="-- fps" />
+                    android:padding="8dp"
+                    android:text="-- fps"
+                    android:textColor="@android:color/white" />
             </FrameLayout>
 
             <!-- Вкладка LOG -->
             <LinearLayout
                 android:id="@+id/logContainer"
-                android:visibility="gone"
-                android:orientation="vertical"
                 android:layout_width="match_parent"
-                android:layout_height="match_parent">
+                android:layout_height="match_parent"
+                android:orientation="vertical"
+                android:visibility="gone">
 
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:padding="8dp"
-                    android:gravity="end">
+                    android:gravity="end"
+                    android:padding="8dp">
+
                     <Button
                         android:id="@+id/btnClearLog"
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
-                        android:text="Очистить"/>
+                        android:text="Очистить" />
                 </LinearLayout>
 
                 <androidx.recyclerview.widget.RecyclerView
                     android:id="@+id/rvLog"
                     android:layout_width="match_parent"
                     android:layout_height="0dp"
-                    android:layout_weight="1"/>
+                    android:layout_weight="1" />
             </LinearLayout>
 
         </FrameLayout>

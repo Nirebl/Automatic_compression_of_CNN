@@ -12,6 +12,10 @@ Java_com_example_testyolo_MainActivity_00024YoloBridge_init(
     return g->load(mgr, "yolov8n.param", "yolov8n.bin");
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_testyolo_MainActivity_00024YoloBridge_release(
+        JNIEnv*, jobject) { g->clear(); }
+
 extern "C" JNIEXPORT jobjectArray JNICALL
 Java_com_example_testyolo_MainActivity_00024YoloBridge_detectRgba(
         JNIEnv* env, jobject /*thiz*/,

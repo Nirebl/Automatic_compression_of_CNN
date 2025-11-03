@@ -15,6 +15,8 @@ public:
                                  int rotationDeg,
                                  float conf_thr, float iou_thr, int dst=640);
 
+    void clear() {net.clear();}
+
 private:
     ncnn::Net net;
 };

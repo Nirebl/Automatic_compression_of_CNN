@@ -63,6 +63,7 @@ class MainActivity : ComponentActivity() {
             rgba: java.nio.ByteBuffer,
             width: Int, height: Int, rowStride: Int, rotationDeg: Int, conf: Float
         ): Array<FloatArray>
+        external fun release()
     }
 
     object ResNetBridge {
@@ -80,6 +81,7 @@ class MainActivity : ComponentActivity() {
             rgba: java.nio.ByteBuffer,
             width: Int, height: Int, rowStride: Int, rotationDeg: Int, topK: Int
         ): FloatArray // [cls0,prob0, cls1,prob1, ...]
+        external fun release()
     }
 
 
@@ -97,6 +99,7 @@ class MainActivity : ComponentActivity() {
             rotationDeg: Int,
             conf: Float, iou: Float
         ): Array<FloatArray> // [x1,y1,x2,y2,score,cls]
+        external fun release()
     }
 
     private val askCamera = registerForActivityResult(
@@ -153,10 +156,26 @@ class MainActivity : ComponentActivity() {
                     position: Int,
                     id: Long
                 ) {
-                    mode = when (position) {
-                        1 -> Mode.FRCNN
-                        2 -> Mode.RESNET
-                        else -> Mode.YOLO
+
+                    when (position) {
+                        0 -> { // YOLO
+                            ResNetBridge.release()
+                            FrcnnBridge.release()
+                            if (!YoloBridge.init(assets)) hud.text = "YOLO init failed"
+                            mode = Mode.YOLO
+                        }
+                        1 -> { // Faster R-CNN
+                            YoloBridge.release()
+                            ResNetBridge.release()
+                            FrcnnBridge.init(assets, "fasterrcnn.param", "fasterrcnn.bin")
+                            mode = Mode.FRCNN
+                        }
+                        2 -> { // ResNet
+                            YoloBridge.release()
+                            FrcnnBridge.release()
+                            ResNetBridge.init(assets, "resnet50.param", "resnet50.bin")
+                            mode = Mode.RESNET
+                        }
                     }
                     // Подгружаем модели по требованию
                     when (mode) {

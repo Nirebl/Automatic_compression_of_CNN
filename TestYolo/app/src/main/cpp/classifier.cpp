@@ -121,6 +121,7 @@ public:
         }
         return top;
     }
+    void clear() { net.clear(); }
 
 private:
     ncnn::Net net;
