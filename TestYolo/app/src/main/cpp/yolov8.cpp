@@ -1,4 +1,4 @@
-#include "yolov8.hpp"
+    #include "yolov8.hpp"
 #include <algorithm>
 #include <cmath>
 
@@ -10,6 +10,13 @@ static inline void read_pixel_rotated(const uint8_t* src,
     if (rot == 90)      { sx = y;          sy = srcW - 1 - x; }
     else if (rot == 180){ sx = srcW - 1 - x; sy = srcH - 1 - y; }
     else if (rot == 270){ sx = srcH - 1 - y; sy = x; }
+    
+    // Bounds check to prevent out-of-bounds memory access
+    if (sx < 0 || sx >= srcW || sy < 0 || sy >= srcH) {
+        R = 114; G = 114; B = 114;  // padding color
+        return;
+    }
+    
     const uint8_t* p = src + sy * rowStride + sx * 4;
     R = p[0]; G = p[1]; B = p[2];
 }
@@ -32,6 +39,11 @@ std::vector<Det> YoloV8::detect_rgba(const uint8_t* rgba, int srcW, int srcH, in
     int new_h = (int)std::round(h * r);
     int pad_w = dst - new_w, pad_h = dst - new_h;
 
+    // Get channel pointers for proper planar access
+    float* ch0 = in.channel(0);
+    float* ch1 = in.channel(1);
+    float* ch2 = in.channel(2);
+    
     for (int y=0; y<dst; y++) {
         for (int x=0; x<dst; x++) {
             int rx = x - pad_w/2, ry = y - pad_h/2;
@@ -41,8 +53,11 @@ std::vector<Det> YoloV8::detect_rgba(const uint8_t* rgba, int srcW, int srcH, in
                 int sy = (int)std::round(ry / r);
                 read_pixel_rotated(rgba, srcW, srcH, rowStride, rot, sx, sy, R,G,B);
             }
-            float* pix = in.row(y) + x*3;
-            pix[0] = R/255.f; pix[1] = G/255.f; pix[2] = B/255.f;
+            // ncnn::Mat is channel-planar, not interleaved
+            int idx = y * dst + x;
+            ch0[idx] = R/255.f;
+            ch1[idx] = G/255.f;
+            ch2[idx] = B/255.f;
         }
     }
 

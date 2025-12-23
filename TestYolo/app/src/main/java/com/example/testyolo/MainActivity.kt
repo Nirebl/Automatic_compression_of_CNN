@@ -3,25 +3,35 @@ package com.example.testyolo
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Size
 import android.view.Surface
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.Spinner
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.*
+import androidx.camera.core.AspectRatio
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.tabs.TabLayout
 import java.nio.ByteBuffer
+import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
-enum class Mode { YOLO, FRCNN, RESNET }
-
-private var mode = Mode.YOLO
+enum class Mode { YOLO, YOLOSEG, RESNET }
 
 class MainActivity : ComponentActivity() {
 
@@ -29,8 +39,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var overlay: OverlayView
     private lateinit var hud: TextView
+    private lateinit var spModel: Spinner
 
-    // tabs & log
     private lateinit var tabLayout: TabLayout
     private lateinit var liveContainer: View
     private lateinit var logContainer: View
@@ -39,64 +49,58 @@ class MainActivity : ComponentActivity() {
     private val logAdapter = DetectionAdapter()
     private var logListener: ((List<DetectionEvent>) -> Unit)? = null
 
-    // labels
+    // Labels
     private lateinit var labels: List<String>
 
     // Camera / analyzer
-    private val exec = Executors.newSingleThreadExecutor()
+    private val cameraExecutor = Executors.newSingleThreadExecutor()
+    private val workExecutor = Executors.newSingleThreadExecutor()
+    private var cameraProviderRef: ProcessCameraProvider? = null
+    private var previewUseCase: Preview? = null
+    private var analysisUseCase: ImageAnalysis? = null
+
+    // Session / race protection
+    @Volatile private var sessionToken = AtomicLong(0L)
+    private val inFlight = AtomicInteger(0)          // кол-во активных инференсов
+    private val switching = AtomicBoolean(false)     // флаг "идёт переключение"
+
+    // FPS
     private var lastT = 0L
     private var frames = 0
-    private var skipEvery = 1 // при необходимости поставь 2 для снижения нагрузки
+    private var skipEvery = 1 // можно 2 для снижения нагрузки
 
-    object FrcnnBridge {
-        init {
-            System.loadLibrary("ncnn"); System.loadLibrary("yolo")
-        }
+    // Current mode
+    private var mode: Mode = Mode.YOLO
 
-        external fun init(
-            assetMgr: android.content.res.AssetManager,
-            param: String,
-            bin: String
-        ): Boolean
+    // --- JNI bridges ---
 
-        external fun detectRgba(
-            rgba: java.nio.ByteBuffer,
-            width: Int, height: Int, rowStride: Int, rotationDeg: Int, conf: Float
-        ): Array<FloatArray>
+    object YoloSegBridge {
+        init { System.loadLibrary("ncnn"); System.loadLibrary("yolo") }
+        external fun init(assetMgr: android.content.res.AssetManager, param: String, bin: String): Boolean
+        external fun detectRgbaBoxesOnly(
+            rgba: ByteBuffer,
+            width: Int, height: Int, rowStride: Int, rotationDeg: Int,
+            conf: Float, iou: Float
+        ): Array<FloatArray>  // [x1,y1,x2,y2,score,cls,mask_w,mask_h]
         external fun release()
     }
 
     object ResNetBridge {
-        init {
-            System.loadLibrary("ncnn"); System.loadLibrary("yolo")
-        }
-
-        external fun init(
-            assetMgr: android.content.res.AssetManager,
-            param: String,
-            bin: String
-        ): Boolean
-
+        init { System.loadLibrary("ncnn"); System.loadLibrary("yolo") }
+        external fun init(assetMgr: android.content.res.AssetManager, param: String, bin: String): Boolean
         external fun classifyRgba(
-            rgba: java.nio.ByteBuffer,
+            rgba: ByteBuffer,
             width: Int, height: Int, rowStride: Int, rotationDeg: Int, topK: Int
         ): FloatArray // [cls0,prob0, cls1,prob1, ...]
         external fun release()
     }
 
-
-    // --- JNI bridge (вложенный объект, см. имена JNI в C++) ---
     object YoloBridge {
-        init {
-            System.loadLibrary("ncnn") // сначала зависимость
-            System.loadLibrary("yolo") // затем наша so
-        }
-
+        init { System.loadLibrary("ncnn"); System.loadLibrary("yolo") }
         external fun init(assetMgr: android.content.res.AssetManager): Boolean
         external fun detectRgba(
             rgba: ByteBuffer,
-            width: Int, height: Int, rowStride: Int,
-            rotationDeg: Int,
+            width: Int, height: Int, rowStride: Int, rotationDeg: Int,
             conf: Float, iou: Float
         ): Array<FloatArray> // [x1,y1,x2,y2,score,cls]
         external fun release()
@@ -114,247 +118,294 @@ class MainActivity : ComponentActivity() {
         previewView = findViewById(R.id.preview)
         overlay = findViewById(R.id.overlay)
         hud = findViewById(R.id.hud)
+        spModel = findViewById(R.id.spModel)
+
         tabLayout = findViewById(R.id.tabLayout)
         liveContainer = findViewById(R.id.liveContainer)
         logContainer = findViewById(R.id.logContainer)
         rvLog = findViewById(R.id.rvLog)
         btnClearLog = findViewById(R.id.btnClearLog)
 
-        // labels & overlay
-        labels = loadLabels()
-        overlay.setLabels(labels)
+        // PreviewView: TextureView-режим
+        previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
 
-        // init YOLO
-        if (!YoloBridge.init(assets)) {
-            hud.text = "YOLO init failed"
-        }
+        // tabs
+        tabLayout.addTab(tabLayout.newTab().setText("LIVE"))
+        tabLayout.addTab(tabLayout.newTab().setText("LOG"))
+        tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab) { switchTab(tab.position) }
+            override fun onTabUnselected(tab: TabLayout.Tab) {}
+            override fun onTabReselected(tab: TabLayout.Tab) { switchTab(tab.position) }
+        })
+        switchTab(0)
 
-        // log view setup
+        // log
         rvLog.layoutManager = LinearLayoutManager(this)
         rvLog.adapter = logAdapter
         btnClearLog.setOnClickListener { DetectionLog.clear() }
-        if (tabLayout.tabCount == 0) {
-            tabLayout.addTab(tabLayout.newTab().setText("LIVE"))
-            tabLayout.addTab(tabLayout.newTab().setText("LOG"))
-        }
-        tabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
-            override fun onTabSelected(tab: TabLayout.Tab) = switchTab(tab.position)
-            override fun onTabUnselected(tab: TabLayout.Tab) {}
-            override fun onTabReselected(tab: TabLayout.Tab) {}
-        })
-        val spModel: android.widget.Spinner = findViewById(R.id.spModel)
-        spModel.adapter = android.widget.ArrayAdapter(
-            this,
-            android.R.layout.simple_spinner_dropdown_item,
-            listOf("YOLOv8 (detector)", "Faster R-CNN (detector)", "ResNet-50 (classifier)")
-        )
-        spModel.onItemSelectedListener =
-            object : android.widget.AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(
-                    parent: android.widget.AdapterView<*>,
-                    view: View?,
-                    position: Int,
-                    id: Long
-                ) {
-
-                    when (position) {
-                        0 -> { // YOLO
-                            ResNetBridge.release()
-                            FrcnnBridge.release()
-                            if (!YoloBridge.init(assets)) hud.text = "YOLO init failed"
-                            mode = Mode.YOLO
-                        }
-                        1 -> { // Faster R-CNN
-                            YoloBridge.release()
-                            ResNetBridge.release()
-                            FrcnnBridge.init(assets, "fasterrcnn.param", "fasterrcnn.bin")
-                            mode = Mode.FRCNN
-                        }
-                        2 -> { // ResNet
-                            YoloBridge.release()
-                            FrcnnBridge.release()
-                            ResNetBridge.init(assets, "resnet50.param", "resnet50.bin")
-                            mode = Mode.RESNET
-                        }
-                    }
-                    // Подгружаем модели по требованию
-                    when (mode) {
-                        Mode.YOLO -> { /* уже init сделан ниже */
-                        }
-
-                        Mode.FRCNN -> FrcnnBridge.init(assets, "fasterrcnn.param", "fasterrcnn.bin")
-                        Mode.RESNET -> ResNetBridge.init(assets, "resnet50.param", "resnet50.bin")
-                    }
-                }
-
-                override fun onNothingSelected(parent: android.widget.AdapterView<*>) {}
-            }
-        switchTab(0)
         logListener = { list -> runOnUiThread { logAdapter.submitList(list) } }
         DetectionLog.addListener(logListener!!)
 
-        // permission
+        // labels
+        labels = loadLabels()
+        overlay.setLabels(labels)
+
+        // spinner
+        spModel.adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_dropdown_item,
+            listOf("YOLOv8 (detector)", "YOLOv11n-seg (segmentation)", "ResNet-50 (classifier)")
+        )
+        spModel.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>, view: View?, position: Int, id: Long) {
+                val newMode = when (position) {
+                    1 -> Mode.YOLOSEG
+                    2 -> Mode.RESNET
+                    else -> Mode.YOLO
+                }
+                if (newMode != mode) {
+                    mode = newMode
+                    switchModeAtomic(newMode)
+                }
+            }
+            override fun onNothingSelected(parent: AdapterView<*>) {}
+        }
+
+        // init YOLO by default
+        runCatching { YoloBridge.init(assets) }
+
+        // camera permission
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
             == PackageManager.PERMISSION_GRANTED
-        ) startCamera()
-        else askCamera.launch(Manifest.permission.CAMERA)
+        ) startCamera() else askCamera.launch(Manifest.permission.CAMERA)
     }
 
     override fun onDestroy() {
         logListener?.let { DetectionLog.removeListener(it) }
+        runCatching { YoloBridge.release() }
+        runCatching { YoloSegBridge.release() }
+        runCatching { ResNetBridge.release() }
+        cameraExecutor.shutdown()
+        workExecutor.shutdown()
         super.onDestroy()
     }
 
-    private fun updateHudFps(numDet: Int) {
-        val now = System.nanoTime()
-        if (lastT == 0L) lastT = now
-        val dt = (now - lastT) / 1e9
-        if (dt >= 1.0) {
-            val fps = frames / dt
-            hud.text = String.format("%.1f fps | %d det", fps, numDet)
-            frames = 0; lastT = now
-        }
-    }
-
-    private fun fpsString(): String {
-        val now = System.nanoTime()
-        if (lastT == 0L) lastT = now
-        val dt = (now - lastT) / 1e9
-        return if (dt >= 1.0) {
-            val fps = frames / dt; frames = 0; lastT = now
-            String.format("%.1f fps", fps)
-        } else "-- fps"
-    }
+    // ---------- Camera ----------
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider = cameraProviderFuture.get()
+            cameraProviderRef = cameraProvider
 
             val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
-
             val preview = Preview.Builder()
                 .setTargetAspectRatio(AspectRatio.RATIO_16_9)
                 .setTargetRotation(rotation)
                 .build()
                 .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            previewUseCase = preview
 
-            val analysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                .setTargetResolution(Size(1280, 720))
-                .setTargetRotation(rotation)
-                .build()
-
-            analysis.setAnalyzer(exec) { image ->
-                try {
-                    frames++
-                    if (frames % skipEvery != 0) {
-                        image.close(); return@setAnalyzer
-                    }
-
-                    val plane = image.planes[0]
-                    val buf = plane.buffer
-
-                    when (mode) {
-                        Mode.YOLO -> {
-                            val dets = YoloBridge.detectRgba(
-                                buf, image.width, image.height, plane.rowStride,
-                                image.imageInfo.rotationDegrees, 0.25f, 0.45f
-                            )
-                            overlay.post {
-                                overlay.update(
-                                    image.width,
-                                    image.height,
-                                    dets.toList(),
-                                    image.imageInfo.rotationDegrees
-                                )
-                                updateHudFps(dets.size)
-                            }
-                            // лог (топ-5)
-                            val events = dets.sortedByDescending { it[4] }.take(5).map { d ->
-                                val cls = d[5].toInt(); DetectionEvent(
-                                System.currentTimeMillis(),
-                                clsName(cls),
-                                d[4]
-                            )
-                            }
-                            DetectionLog.addAll(events)
-                        }
-
-                        Mode.FRCNN -> {
-                            val dets = FrcnnBridge.detectRgba(
-                                buf, image.width, image.height, plane.rowStride,
-                                image.imageInfo.rotationDegrees, 0.25f
-                            )
-                            overlay.post {
-                                overlay.update(
-                                    image.width,
-                                    image.height,
-                                    dets.toList(),
-                                    image.imageInfo.rotationDegrees
-                                )
-                                updateHudFps(dets.size)
-                            }
-                            val events = dets.sortedByDescending { it[4] }.take(5).map { d ->
-                                val cls = d[5].toInt(); DetectionEvent(
-                                System.currentTimeMillis(),
-                                clsName(cls),
-                                d[4]
-                            )
-                            }
-                            DetectionLog.addAll(events)
-                        }
-
-                        Mode.RESNET -> {
-                            val top = ResNetBridge.classifyRgba(
-                                buf, image.width, image.height, plane.rowStride,
-                                image.imageInfo.rotationDegrees, 5
-                            ) // top-5
-                            // скрываем боксы
-                            overlay.post {
-                                overlay.update(
-                                    image.width,
-                                    image.height,
-                                    emptyList(),
-                                    image.imageInfo.rotationDegrees
-                                )
-                                // рисуем в HUD top-1
-                                val label = if (top.size >= 2) {
-                                    val cls = top[0].toInt();
-                                    val prob = top[1]
-                                    "${clsName(cls)} ${
-                                        "%.1f".format(
-                                            java.util.Locale.US,
-                                            prob * 100
-                                        )
-                                    }%"
-                                } else "--"
-                                hud.text = "$label  |  ${fpsString()}"
-                            }
-                            // лог: top-5 в события
-                            val now = System.currentTimeMillis()
-                            val events = mutableListOf<DetectionEvent>()
-                            for (i in top.indices step 2) {
-                                val cls = top[i].toInt()
-                                val prob = if (i + 1 < top.size) top[i + 1] else 0f
-                                events += DetectionEvent(now, clsName(cls), prob)
-                            }
-                            DetectionLog.addAll(events)
-                        }
-                    }
-                } finally {
-                    image.close()
-                }
-            }
-
+            val myToken = sessionToken.incrementAndGet()
+            val analysis = buildAnalyzerUseCase(rotation, myToken)
+            analysisUseCase = analysis
 
             cameraProvider.unbindAll()
             cameraProvider.bindToLifecycle(
-                this, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis
+                this as LifecycleOwner,
+                CameraSelector.DEFAULT_BACK_CAMERA,
+                preview,
+                analysis
             )
         }, ContextCompat.getMainExecutor(this))
     }
+
+    private fun buildAnalyzerUseCase(targetRotation: Int, token: Long): ImageAnalysis {
+        val analysis = ImageAnalysis.Builder()
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setTargetResolution(Size(1280, 720))
+            .setTargetRotation(targetRotation)
+            .build()
+
+        analysis.setAnalyzer(cameraExecutor, ImageAnalysis.Analyzer { image ->
+            // игнорируем кадры прошлых сессий
+            if (sessionToken.get() != token) { image.close(); return@Analyzer }
+
+            inFlight.incrementAndGet()
+            try {
+                frames++
+                if (frames % skipEvery != 0) { image.close(); return@Analyzer }
+
+                val plane = image.planes[0]
+                val buf = plane.buffer // RGBA8888
+                when (mode) {
+                    Mode.YOLO -> {
+                        val dets = YoloBridge.detectRgba(
+                            buf, image.width, image.height, plane.rowStride,
+                            image.imageInfo.rotationDegrees, 0.25f, 0.45f
+                        )
+                        overlay.post {
+                            overlay.update(
+                                image.width, image.height, dets.toList(),
+                                image.imageInfo.rotationDegrees
+                            )
+                            updateHudFps(dets.size)
+                        }
+                        val events = dets.sortedByDescending { it[4] }.take(5).map { d ->
+                            DetectionEvent(
+                                System.currentTimeMillis(),
+                                clsName(d[5].toInt()),
+                                d[4]
+                            )
+                        }
+                        DetectionLog.addAll(events)
+                    }
+                    Mode.YOLOSEG -> {
+                        val dets = YoloSegBridge.detectRgbaBoxesOnly(
+                            buf, image.width, image.height, plane.rowStride,
+                            image.imageInfo.rotationDegrees, 0.25f, 0.45f
+                        )
+                        overlay.post {
+                            overlay.updateSeg(
+                                image.width, image.height, dets.toList(),
+                                image.imageInfo.rotationDegrees
+                            )
+                            updateHudFps(dets.size)
+                        }
+                        val events = dets.sortedByDescending { it[4] }.take(5).map { d ->
+                            DetectionEvent(
+                                System.currentTimeMillis(),
+                                clsName(d[5].toInt()),
+                                d[4]
+                            )
+                        }
+                        DetectionLog.addAll(events)
+                    }
+                    Mode.RESNET -> {
+                        val top = ResNetBridge.classifyRgba(
+                            buf, image.width, image.height, plane.rowStride,
+                            image.imageInfo.rotationDegrees, 5
+                        )
+                        overlay.post {
+                            overlay.update(
+                                image.width, image.height, emptyList(),
+                                image.imageInfo.rotationDegrees
+                            )
+                            val label = if (top.size >= 2) {
+                                val cls = top[0].toInt()
+                                val prob = top[1]
+                                "${clsName(cls)} ${"%.1f".format(Locale.US, prob * 100)}%"
+                            } else "--"
+                            hud.text = "$label  |  ${fpsString()}"
+                        }
+                        val now = System.currentTimeMillis()
+                        val events = mutableListOf<DetectionEvent>()
+                        var i = 0
+                        while (i + 1 < top.size) {
+                            val cls = top[i].toInt()
+                            val prob = top[i + 1]
+                            events += DetectionEvent(now, clsName(cls), prob)
+                            i += 2
+                        }
+                        DetectionLog.addAll(events)
+                    }
+                }
+            } catch (_: Throwable) {
+                // не падаем из анализатора
+            } finally {
+                image.close()
+                inFlight.decrementAndGet()
+            }
+        })
+        return analysis
+    }
+
+    /**
+     * Ждём завершения всех текущих инференсов.
+     */
+    private fun waitForInFlightToDrain(timeoutMs: Long = 800): Boolean {
+        val start = SystemClock.uptimeMillis()
+        while (inFlight.get() > 0) {
+            if (SystemClock.uptimeMillis() - start >= timeoutMs) return false
+            try { Thread.sleep(10) } catch (_: InterruptedException) { break }
+        }
+        return true
+    }
+
+    /**
+     * Атомарное переключение профиля:
+     * 1) останавливаем анализ и unbindAll()
+     * 2) ждём, пока обнулятся активные инференсы
+     * 3) release()/init() нужной модели (в фоне)
+     * 4) новый sessionToken и bind нового анализатора
+     */
+    private fun switchModeAtomic(newMode: Mode) {
+        if (!switching.compareAndSet(false, true)) return  // уже идёт переключение
+
+        val provider = cameraProviderRef
+        val preview = previewUseCase
+        if (provider == null || preview == null) {
+            switching.set(false)
+            return
+        }
+
+        // 1) стоп анализа и полный unbind
+        runOnUiThread {
+            runCatching { analysisUseCase?.clearAnalyzer() }
+            runCatching { provider.unbindAll() }
+            analysisUseCase = null
+        }
+
+        // 2) дождаться окончания текущих JNI-вызовов
+        waitForInFlightToDrain(1000)
+
+        // 3) release/init на ворк-исполнителе
+        workExecutor.execute {
+            when (newMode) {
+                Mode.YOLO -> {
+                    runCatching { ResNetBridge.release() }
+                    runCatching { YoloSegBridge.release() }
+                    runCatching { YoloBridge.init(assets) }
+                }
+                Mode.YOLOSEG -> {
+                    runCatching { YoloBridge.release() }
+                    runCatching { ResNetBridge.release() }
+                    runCatching { YoloSegBridge.init(assets, "yolov11n-seg.param", "yolov11n-seg.bin") }
+                }
+                Mode.RESNET -> {
+                    runCatching { YoloBridge.release() }
+                    runCatching { YoloSegBridge.release() }
+                    runCatching { ResNetBridge.init(assets, "resnet50.param", "resnet50.bin") }
+                }
+            }
+
+            val myToken = sessionToken.incrementAndGet()
+
+            // 4) пересборка анализатора и bind
+            runOnUiThread {
+                try {
+                    val rotation = previewView.display?.rotation ?: Surface.ROTATION_0
+                    preview.setSurfaceProvider(previewView.surfaceProvider)
+                    val analysis = buildAnalyzerUseCase(rotation, myToken)
+                    analysisUseCase = analysis
+                    cameraProviderRef?.bindToLifecycle(
+                        this@MainActivity,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis
+                    )
+                } catch (_: Throwable) {
+                    // не роняем процесс
+                } finally {
+                    switching.set(false)
+                }
+            }
+        }
+    }
+
+    // ---------- UI helpers ----------
 
     private fun switchTab(pos: Int) {
         if (pos == 0) {
@@ -369,9 +420,25 @@ class MainActivity : ComponentActivity() {
     private fun clsName(clsIdx: Int): String =
         labels.getOrNull(clsIdx) ?: "class_$clsIdx"
 
-    // Загружаем имена классов из assets:
-    // 1) coco.names (по строке на класс)
-    // 2) metadata.yaml (Ultralytics: names: [...] или names: {0: person, ...})
+    private fun updateHudFps(numDet: Int) {
+        val now = System.nanoTime()
+        if (lastT == 0L) lastT = now
+        val dt = (now - lastT) / 1e9
+        if (dt >= 1.0) {
+            val fps = frames / dt
+            hud.text = String.format(Locale.US, "%.1f fps | %d det", fps, numDet)
+            frames = 0; lastT = now
+        }
+    }
+
+    private fun fpsString(): String {
+        val now = System.nanoTime()
+        if (lastT == 0L) return "-- fps"
+        val dt = (now - lastT) / 1e9
+        val fps = if (dt > 0) frames / dt else 0.0
+        return String.format(Locale.US, "%.1f fps", fps)
+    }
+
     private fun loadLabels(): List<String> {
         // coco.names
         runCatching {
@@ -383,13 +450,11 @@ class MainActivity : ComponentActivity() {
         // metadata.yaml
         runCatching {
             val yaml = assets.open("metadata.yaml").bufferedReader().use { it.readText() }
-            // names: ["person","bicycle",...]
             Regex("""names:\s*\[(.*?)\]""", RegexOption.DOT_MATCHES_ALL)
                 .find(yaml)?.groupValues?.getOrNull(1)?.let { inside ->
                     val list = inside.split(',').map { it.trim().trim('"', '\'') }
                     if (list.isNotEmpty()) return list
                 }
-            // names: {0: person, 1: bicycle, ...}
             Regex("""names:\s*\{(.*?)\}""", RegexOption.DOT_MATCHES_ALL)
                 .find(yaml)?.groupValues?.getOrNull(1)?.let { inside ->
                     val list = inside.split(',').mapNotNull { part ->

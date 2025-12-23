@@ -13,8 +13,9 @@ foreach(f
         yolov8.cpp
         classifier_jni.cpp
         classifier.cpp
-        fastcnn_jni.cpp
-        fasterrcnn.cpp
+        yolov11seg_jni.cpp
+        yolov11seg.cpp
+        yolov11seg.hpp
 )
     if(EXISTS ${SRC_DIR}/${f})
         list(APPEND SOURCES ${f})
