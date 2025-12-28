@@ -13,4 +13,11 @@
         <item name="android:statusBarColor">?attr/colorPrimaryVariant</item>
         <!-- Customize your theme here. -->
     </style>
+
+    <!-- Dark dialog theme for benchmark -->
+    <style name="DarkDialogTheme" parent="Theme.Material3.Dark.Dialog.Alert">
+        <item name="colorPrimary">#ff8906</item>
+        <item name="colorOnSurface">#fffffe</item>
+        <item name="android:background">#1a1a2e</item>
+    </style>
 </resources>

@@ -17,6 +17,14 @@ class StartActivity : ComponentActivity() {
         findViewById<android.view.View>(R.id.btnBenchmark).setOnClickListener {
             startActivity(Intent(this, BenchmarkActivity::class.java))
         }
+
+        findViewById<android.view.View>(R.id.btnYoloBenchmark).setOnClickListener {
+            startActivity(Intent(this, YoloBenchmarkActivity::class.java))
+        }
+
+        findViewById<android.view.View>(R.id.btnYoloSegBenchmark).setOnClickListener {
+            startActivity(Intent(this, YoloSegBenchmarkActivity::class.java))
+        }
     }
 }
 

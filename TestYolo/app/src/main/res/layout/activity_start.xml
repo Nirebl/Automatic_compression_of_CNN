@@ -49,18 +49,44 @@
         android:backgroundTint="#ff8906"
         android:layout_marginBottom="16dp" />
 
-    <!-- Benchmark Button -->
+    <!-- Benchmark Button (ResNet CIFAR-10) -->
     <Button
         android:id="@+id/btnBenchmark"
         android:layout_width="280dp"
-        android:layout_height="64dp"
-        android:text="⚡  Benchmark"
+        android:layout_height="56dp"
+        android:text="⚡  ResNet Benchmark"
         android:textColor="#fffffe"
-        android:textSize="18sp"
+        android:textSize="16sp"
         android:textStyle="bold"
         android:textAllCaps="false"
         android:backgroundTint="#e53170"
-        android:layout_marginBottom="48dp" />
+        android:layout_marginBottom="12dp" />
+
+    <!-- YOLO Benchmark Button -->
+    <Button
+        android:id="@+id/btnYoloBenchmark"
+        android:layout_width="280dp"
+        android:layout_height="56dp"
+        android:text="📊  YOLO Detection Test"
+        android:textColor="#0f0e17"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textAllCaps="false"
+        android:backgroundTint="#00d26a"
+        android:layout_marginBottom="12dp" />
+
+    <!-- YOLO-Seg Benchmark Button -->
+    <Button
+        android:id="@+id/btnYoloSegBenchmark"
+        android:layout_width="280dp"
+        android:layout_height="56dp"
+        android:text="🎭  YOLO-Seg Test (ADE20K)"
+        android:textColor="#0f0e17"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textAllCaps="false"
+        android:backgroundTint="#7b5cff"
+        android:layout_marginBottom="32dp" />
 
     <!-- Footer info -->
     <TextView

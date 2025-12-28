@@ -30,7 +30,10 @@ static inline void read_pixel_rotated(const uint8_t* src,
 }
 
 bool YoloV11Seg::load(AAssetManager* mgr, const char* param, const char* bin) {
-    net.opt.use_vulkan_compute = true;
+    // Disable Vulkan compute - causes SIGSEGV crashes on many devices
+    net.opt.use_vulkan_compute = false;
+    net.opt.num_threads = 1;  // Single thread to avoid OpenMP crashes
+    
     int rp = net.load_param(mgr, param);
     int rm = net.load_model(mgr, bin);
     if (rp != 0 || rm != 0) {
@@ -38,14 +41,59 @@ bool YoloV11Seg::load(AAssetManager* mgr, const char* param, const char* bin) {
                             "load failed param=%d bin=%d", rp, rm);
         return false;
     }
+    loadedInputSize = 640;  // Default model size
     __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "YOLOv11-seg model loaded");
     return true;
+}
+
+bool YoloV11Seg::loadForSize(AAssetManager* mgr, int inputSize) {
+    // Clear previous model
+    net.clear();
+    
+    // Disable Vulkan compute
+    net.opt.use_vulkan_compute = false;
+    net.opt.num_threads = 1;
+    
+    // For sizes >= 640, use the 640 model
+    int modelSize = inputSize;
+    if (inputSize >= 640) {
+        modelSize = 640;
+    }
+    
+    // Build filename: yolov11n-seg_320.param, yolov11n-seg_320.bin
+    char paramFile[64], binFile[64];
+    snprintf(paramFile, sizeof(paramFile), "yolov11n-seg_%d.param", modelSize);
+    snprintf(binFile, sizeof(binFile), "yolov11n-seg_%d.bin", modelSize);
+    
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Loading model: %s (for input size %d)", paramFile, inputSize);
+    
+    int paramResult = net.load_param(mgr, paramFile);
+    int binResult = net.load_model(mgr, binFile);
+    
+    if (paramResult == 0 && binResult == 0) {
+        loadedInputSize = inputSize;
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "Model loaded for size %d (using %d model)", inputSize, modelSize);
+        return true;
+    }
+    
+    __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "Failed to load model for size %d (param=%d, bin=%d)", 
+                        inputSize, paramResult, binResult);
+    return false;
 }
 
 std::vector<SegDet> YoloV11Seg::detect_rgba(const uint8_t* rgba, int srcW, int srcH,
                                             int rowStride, int rot,
                                             float conf_thr, float iou_thr, int dst) {
     if (!rgba || srcW <= 0 || srcH <= 0) return {};
+    
+    // Ensure dst is a multiple of 32 (YOLO stride requirement)
+    dst = ((dst + 31) / 32) * 32;
+    // Minimum 416px for YOLOv11-seg (smaller sizes may cause model issues)
+    if (dst < 416) dst = 416;
+    if (dst > 1280) dst = 1280;  // Cap at reasonable max
+    
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, 
+        "detect_rgba: srcW=%d srcH=%d dst=%d", srcW, srcH, dst);
 
     // Dimensions after rotation
     int w = (rot == 90 || rot == 270) ? srcH : srcW;
@@ -94,13 +142,21 @@ std::vector<SegDet> YoloV11Seg::detect_rgba(const uint8_t* rgba, int srcW, int s
     // Detection output (boxes + classes + mask coefficients)
     ncnn::Mat out_det;
     if (ex.extract("out0", out_det) != 0 && ex.extract("output0", out_det) != 0) {
-        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "ex.extract det failed");
+        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "ex.extract det failed for dst=%d", dst);
         return {};
     }
+    __android_log_print(ANDROID_LOG_INFO, LOG_TAG, 
+        "out_det: w=%d h=%d c=%d (dst=%d)", out_det.w, out_det.h, out_det.c, dst);
 
     // Prototype masks output
     ncnn::Mat out_proto;
     bool has_proto = (ex.extract("out1", out_proto) == 0 || ex.extract("output1", out_proto) == 0);
+    if (has_proto) {
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, 
+            "out_proto: w=%d h=%d c=%d", out_proto.w, out_proto.h, out_proto.c);
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "No proto output");
+    }
 
     // Parse detection output
     // YOLOv11-seg format: [x, y, w, h, cls0..cls79, mask0..mask31] per prediction
@@ -237,10 +293,19 @@ std::vector<SegDet> YoloV11Seg::detect_rgba(const uint8_t* rgba, int srcW, int s
         return inter / (area_a + area_b - inter + 1e-6f);
     };
 
-    // Proto mask dimensions
-    int proto_h = has_proto && out_proto.h > 0 ? out_proto.h : mask_proto_h;
-    int proto_w = has_proto && out_proto.w > 0 ? out_proto.w : mask_proto_w;
-    int proto_c = has_proto && out_proto.c > 0 ? out_proto.c : local_mask_dim;
+    // Proto mask dimensions - get actual dimensions from the output tensor
+    int proto_h = 0, proto_w = 0, proto_c = 0;
+    if (has_proto && out_proto.data) {
+        proto_c = out_proto.c;
+        proto_h = out_proto.h;
+        proto_w = out_proto.w;
+        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, 
+            "Proto dims: c=%d h=%d w=%d (dst=%d)", proto_c, proto_h, proto_w, dst);
+    }
+    
+    // Validate proto dimensions - must be positive and reasonable
+    bool valid_proto = has_proto && proto_c > 0 && proto_h > 0 && proto_w > 0 &&
+                       proto_c == local_mask_dim;
 
     for (size_t i = 0; i < props.size(); ++i) {
         if (suppressed[i]) continue;
@@ -255,13 +320,13 @@ std::vector<SegDet> YoloV11Seg::detect_rgba(const uint8_t* rgba, int srcW, int s
         det.mask_w = 0;
         det.mask_h = 0;
 
-        // Generate mask if we have proto and coefficients
-        if (has_proto && out_proto.data && !p.mask_coeffs.empty() &&
+        // Generate mask if we have valid proto and coefficients
+        if (valid_proto && !p.mask_coeffs.empty() &&
             proto_c == (int)p.mask_coeffs.size()) {
 
             // Compute bounding box in proto mask space
-            float scale_x = (float)proto_w / dst;
-            float scale_y = (float)proto_h / dst;
+            float scale_x = (float)proto_w / (float)dst;
+            float scale_y = (float)proto_h / (float)dst;
 
             int mx1 = std::max(0, (int)std::floor((p.cx - p.bw / 2) * scale_x));
             int my1 = std::max(0, (int)std::floor((p.cy - p.bh / 2) * scale_y));
@@ -271,7 +336,7 @@ std::vector<SegDet> YoloV11Seg::detect_rgba(const uint8_t* rgba, int srcW, int s
             int mw = mx2 - mx1;
             int mh = my2 - my1;
 
-            if (mw > 0 && mh > 0) {
+            if (mw > 0 && mh > 0 && mx2 <= proto_w && my2 <= proto_h) {
                 det.mask_w = mw;
                 det.mask_h = mh;
                 det.mask.resize(mw * mh);
@@ -282,10 +347,13 @@ std::vector<SegDet> YoloV11Seg::detect_rgba(const uint8_t* rgba, int srcW, int s
                         float sum = 0.f;
                         int abs_x = mx1 + px;
                         int abs_y = my1 + py;
-
-                        for (int c = 0; c < proto_c; ++c) {
-                            const float* proto_ch = out_proto.channel(c);
-                            sum += p.mask_coeffs[c] * proto_ch[abs_y * proto_w + abs_x];
+                        
+                        // Bounds check
+                        if (abs_x >= 0 && abs_x < proto_w && abs_y >= 0 && abs_y < proto_h) {
+                            for (int c = 0; c < proto_c; ++c) {
+                                const float* proto_ch = out_proto.channel(c);
+                                sum += p.mask_coeffs[c] * proto_ch[abs_y * proto_w + abs_x];
+                            }
                         }
 
                         det.mask[py * mw + px] = sigmoid(sum) > 0.5f ? 255 : 0;

@@ -14,6 +14,9 @@ struct SegDet {
 class YoloV11Seg {
 public:
     bool load(AAssetManager* mgr, const char* param, const char* bin);
+    
+    // Load model for specific input size (e.g., yolov11n-seg_320.param)
+    bool loadForSize(AAssetManager* mgr, int inputSize);
 
     // Real-time camera path (RGBA + stride + rotation)
     // Returns detections with segmentation masks
@@ -23,6 +26,8 @@ public:
                                     float conf_thr, float iou_thr, int dst = 640);
 
     void clear() { net.clear(); }
+    
+    int getLoadedSize() const { return loadedInputSize; }
 
 private:
     ncnn::Net net;
@@ -30,5 +35,6 @@ private:
     int mask_proto_dim = 32;   // Number of mask prototype channels
     int mask_proto_h = 160;    // Prototype mask height (for 640 input)
     int mask_proto_w = 160;    // Prototype mask width
+    int loadedInputSize = 640;
 };
 

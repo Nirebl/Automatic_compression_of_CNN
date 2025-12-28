@@ -5,6 +5,7 @@
         android:name="android.hardware.camera"
         android:required="false" />
     <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.INTERNET"/>
 
     <application
         android:allowBackup="true"
@@ -26,6 +27,14 @@
 
         <activity
             android:name=".BenchmarkActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".YoloBenchmarkActivity"
+            android:exported="false" />
+
+        <activity
+            android:name=".YoloSegBenchmarkActivity"
             android:exported="false" />
 
     </application>

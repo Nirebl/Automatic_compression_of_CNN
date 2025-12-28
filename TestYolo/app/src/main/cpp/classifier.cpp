@@ -21,8 +21,9 @@
 class ResNet50 {
 public:
     bool load(AAssetManager* mgr, const char* param, const char* bin) {
-        // Если на устройстве есть Vulkan — ncnn сам использует его для ускорения
-        net.opt.use_vulkan_compute = true;
+        // Disable Vulkan compute - causes SIGSEGV crashes on many devices
+        net.opt.use_vulkan_compute = false;
+        net.opt.num_threads = 4;
 
         if (net.load_param(mgr, param) != 0) {
             __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, "load_param(%s) failed", param);

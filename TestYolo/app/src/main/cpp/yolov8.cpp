@@ -22,8 +22,49 @@ static inline void read_pixel_rotated(const uint8_t* src,
 }
 
 bool YoloV8::load(AAssetManager* mgr, const char* param, const char* bin) {
-    net.opt.use_vulkan_compute = true; // если доступно
+    // Disable Vulkan compute - causes SIGSEGV crashes on many devices
+    net.opt.use_vulkan_compute = false;
+    
+    // Use single thread to avoid OpenMP crashes with dynamic input sizes
+    net.opt.num_threads = 1;
+    
+    loadedInputSize = 640; // Default model size
     return net.load_param(mgr, param) == 0 && net.load_model(mgr, bin) == 0;
+}
+
+bool YoloV8::loadForSize(AAssetManager* mgr, int inputSize) {
+    // Clear previous model
+    net.clear();
+    
+    // Disable Vulkan compute
+    net.opt.use_vulkan_compute = false;
+    net.opt.num_threads = 1;
+    
+    // For sizes >= 640, use the 640 model (we only have 320, 480, 640 models)
+    int modelSize = inputSize;
+    if (inputSize >= 640) {
+        modelSize = 640;
+    }
+    
+    // Build filename based on model size: yolov8n_320.param, yolov8n_320.bin
+    char paramFile[64], binFile[64];
+    snprintf(paramFile, sizeof(paramFile), "yolov8n_%d.param", modelSize);
+    snprintf(binFile, sizeof(binFile), "yolov8n_%d.bin", modelSize);
+    
+    __android_log_print(ANDROID_LOG_INFO, "yolo", "Loading model: %s (for input size %d)", paramFile, inputSize);
+    
+    int paramResult = net.load_param(mgr, paramFile);
+    int binResult = net.load_model(mgr, binFile);
+    
+    if (paramResult == 0 && binResult == 0) {
+        loadedInputSize = inputSize;  // Store the actual input size we'll use
+        __android_log_print(ANDROID_LOG_INFO, "yolo", "Model loaded for size %d (using %d model)", inputSize, modelSize);
+        return true;
+    }
+    
+    __android_log_print(ANDROID_LOG_ERROR, "yolo", "Failed to load model for size %d (param=%d, bin=%d)", 
+                        inputSize, paramResult, binResult);
+    return false;
 }
 
 std::vector<Det> YoloV8::detect_rgba(const uint8_t* rgba, int srcW, int srcH, int rowStride,
