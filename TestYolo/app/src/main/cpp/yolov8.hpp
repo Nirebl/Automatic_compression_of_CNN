@@ -21,8 +21,13 @@ public:
     void clear() {net.clear();}
     
     int getLoadedSize() const { return loadedInputSize; }
+    
+    // Optimization mode control
+    void setOptimized(bool enabled) { useOptimizations = enabled; }
+    bool isOptimized() const { return useOptimizations; }
 
 private:
     ncnn::Net net;
     int loadedInputSize = 640;
+    bool useOptimizations = true;  // Default: optimizations enabled
 };

@@ -148,3 +148,22 @@ Java_com_example_testyolo_YoloBenchmarkActivity_00024YoloBridge_release(
     }
     g_assetMgr = nullptr;
 }
+
+// Set optimization mode (true = optimized, false = baseline)
+extern "C" JNIEXPORT void JNICALL
+Java_com_example_testyolo_YoloBenchmarkActivity_00024YoloBridge_setOptimized(
+        JNIEnv*, jobject, jboolean enabled) {
+    if (g) {
+        g->setOptimized(enabled);
+    }
+}
+
+// Get current optimization mode
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_example_testyolo_YoloBenchmarkActivity_00024YoloBridge_isOptimized(
+        JNIEnv*, jobject) {
+    if (g) {
+        return g->isOptimized();
+    }
+    return true;
+}

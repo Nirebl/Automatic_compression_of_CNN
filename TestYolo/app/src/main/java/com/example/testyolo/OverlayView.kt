@@ -14,19 +14,34 @@ class OverlayView(context: Context, attrs: AttributeSet): View(context, attrs) {
     private var rotation = 0
     private var labels: List<String> = emptyList()
     private var isSegMode = false  // Flag for segmentation mode
+    private var hasContours = false  // Flag for contour-based drawing
 
-    // Colors for different classes in segmentation mode
-    private val segColors = listOf(
-        Color.argb(100, 255, 0, 0),    // Red
-        Color.argb(100, 0, 255, 0),    // Green
-        Color.argb(100, 0, 0, 255),    // Blue
-        Color.argb(100, 255, 255, 0),  // Yellow
-        Color.argb(100, 255, 0, 255),  // Magenta
-        Color.argb(100, 0, 255, 255),  // Cyan
-        Color.argb(100, 255, 128, 0),  // Orange
-        Color.argb(100, 128, 0, 255),  // Purple
-        Color.argb(100, 0, 255, 128),  // Teal
-        Color.argb(100, 255, 0, 128),  // Pink
+    // Colors for different classes in segmentation mode (fill)
+    private val segFillColors = listOf(
+        Color.argb(80, 255, 0, 0),    // Red
+        Color.argb(80, 0, 255, 0),    // Green
+        Color.argb(80, 0, 0, 255),    // Blue
+        Color.argb(80, 255, 255, 0),  // Yellow
+        Color.argb(80, 255, 0, 255),  // Magenta
+        Color.argb(80, 0, 255, 255),  // Cyan
+        Color.argb(80, 255, 128, 0),  // Orange
+        Color.argb(80, 128, 0, 255),  // Purple
+        Color.argb(80, 0, 255, 128),  // Teal
+        Color.argb(80, 255, 0, 128),  // Pink
+    )
+    
+    // Solid colors for polygon stroke
+    private val segStrokeColors = listOf(
+        Color.rgb(255, 0, 0),    // Red
+        Color.rgb(0, 255, 0),    // Green
+        Color.rgb(0, 0, 255),    // Blue
+        Color.rgb(255, 255, 0),  // Yellow
+        Color.rgb(255, 0, 255),  // Magenta
+        Color.rgb(0, 255, 255),  // Cyan
+        Color.rgb(255, 128, 0),  // Orange
+        Color.rgb(128, 0, 255),  // Purple
+        Color.rgb(0, 255, 128),  // Teal
+        Color.rgb(255, 0, 128),  // Pink
     )
 
     private val boxPaint = Paint().apply {
@@ -39,6 +54,11 @@ class OverlayView(context: Context, attrs: AttributeSet): View(context, attrs) {
         style = Paint.Style.FILL
         isAntiAlias = true
     }
+    private val segStrokePaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        isAntiAlias = true
+    }
     private val textPaint = Paint().apply {
         color = Color.WHITE
         textSize = 32f
@@ -46,7 +66,7 @@ class OverlayView(context: Context, attrs: AttributeSet): View(context, attrs) {
     }
     private val bgPaint = Paint().apply {
         style = Paint.Style.FILL
-        color = Color.argb(160, 0, 0, 0) // полупрозрачный фон под подписью
+        color = Color.argb(160, 0, 0, 0) // semi-transparent background for labels
         isAntiAlias = true
     }
 
@@ -57,12 +77,21 @@ class OverlayView(context: Context, attrs: AttributeSet): View(context, attrs) {
     fun update(imgW: Int, imgH: Int, dets: List<FloatArray>, rotationDeg: Int) {
         this.imgW = imgW; this.imgH = imgH; this.dets = dets; this.rotation = rotationDeg
         this.isSegMode = false
+        this.hasContours = false
         invalidate()
     }
 
     fun updateSeg(imgW: Int, imgH: Int, dets: List<FloatArray>, rotationDeg: Int) {
         this.imgW = imgW; this.imgH = imgH; this.dets = dets; this.rotation = rotationDeg
         this.isSegMode = true
+        this.hasContours = false
+        invalidate()
+    }
+    
+    fun updateSegWithContours(imgW: Int, imgH: Int, dets: List<FloatArray>, rotationDeg: Int) {
+        this.imgW = imgW; this.imgH = imgH; this.dets = dets; this.rotation = rotationDeg
+        this.isSegMode = true
+        this.hasContours = true
         invalidate()
     }
 
@@ -91,12 +120,10 @@ class OverlayView(context: Context, attrs: AttributeSet): View(context, attrs) {
             val clsIdx = d[5].toInt()
 
             // Transform original coords to rotated display coords
-            // C++ read_pixel_rotated for rot=90: sx=y, sy=srcW-1-x
-            // So inverse: original (ox, oy) → rotated (oy, imgW - 1 - ox)
             val (rx1, ry1, rx2, ry2) = when (rotation) {
                 90 -> floatArrayOf(
-                    oy1, imgW - 1 - ox2,  // top-left in rotated
-                    oy2, imgW - 1 - ox1   // bottom-right in rotated
+                    oy1, imgW - 1 - ox2,
+                    oy2, imgW - 1 - ox1
                 )
                 180 -> floatArrayOf(
                     imgW - 1 - ox2, imgH - 1 - oy2,
@@ -114,16 +141,65 @@ class OverlayView(context: Context, attrs: AttributeSet): View(context, attrs) {
             val vy1 = ry1 * scale + offsetY
             val vx2 = rx2 * scale + offsetX
             val vy2 = ry2 * scale + offsetY
+            
+            val colorIdx = ((clsIdx % segFillColors.size) + segFillColors.size) % segFillColors.size
 
-            // In segmentation mode, draw filled box with class-based color
-            if (isSegMode && clsIdx >= 0) {
-                val colorIdx = ((clsIdx % segColors.size) + segColors.size) % segColors.size
-                segFillPaint.color = segColors[colorIdx]
+            // Handle segmentation mode with contours
+            if (isSegMode && hasContours && d.size > 7) {
+                val numContourPoints = d[6].toInt()
+                if (numContourPoints >= 3) {
+                    val path = Path()
+                    var firstX = 0f
+                    var firstY = 0f
+                    
+                    for (i in 0 until numContourPoints) {
+                        val px = d[7 + i * 2]
+                        val py = d[7 + i * 2 + 1]
+                        
+                        // Transform contour point to view coordinates
+                        val (rpx, rpy) = when (rotation) {
+                            90 -> py to (imgW - 1 - px)
+                            180 -> (imgW - 1 - px) to (imgH - 1 - py)
+                            270 -> (imgH - 1 - py) to px
+                            else -> px to py
+                        }
+                        val vpx = rpx * scale + offsetX
+                        val vpy = rpy * scale + offsetY
+                        
+                        if (i == 0) {
+                            path.moveTo(vpx, vpy)
+                            firstX = vpx
+                            firstY = vpy
+                        } else {
+                            path.lineTo(vpx, vpy)
+                        }
+                    }
+                    path.close()
+                    
+                    // Draw filled polygon
+                    segFillPaint.color = segFillColors[colorIdx]
+                    c.drawPath(path, segFillPaint)
+                    
+                    // Draw polygon outline
+                    segStrokePaint.color = segStrokeColors[colorIdx]
+                    c.drawPath(path, segStrokePaint)
+                } else {
+                    // Fallback to filled box if not enough contour points
+                    segFillPaint.color = segFillColors[colorIdx]
+                    c.drawRect(vx1, vy1, vx2, vy2, segFillPaint)
+                    boxPaint.color = segStrokeColors[colorIdx]
+                    c.drawRect(vx1, vy1, vx2, vy2, boxPaint)
+                    boxPaint.color = Color.GREEN  // Reset
+                }
+            } else if (isSegMode && clsIdx >= 0) {
+                // Old seg mode without contours - draw filled box
+                segFillPaint.color = segFillColors[colorIdx]
                 c.drawRect(vx1, vy1, vx2, vy2, segFillPaint)
+                c.drawRect(vx1, vy1, vx2, vy2, boxPaint)
+            } else {
+                // Detection mode - just draw bounding box
+                c.drawRect(vx1, vy1, vx2, vy2, boxPaint)
             }
-
-            // Draw bounding box
-            c.drawRect(vx1, vy1, vx2, vy2, boxPaint)
 
             // Draw label
             val name = labels.getOrNull(clsIdx) ?: clsIdx.toString()

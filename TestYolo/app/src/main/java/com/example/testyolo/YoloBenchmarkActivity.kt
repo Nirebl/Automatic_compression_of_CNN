@@ -9,6 +9,7 @@ import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
+import android.widget.Switch
 import androidx.activity.ComponentActivity
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -47,6 +48,8 @@ class YoloBenchmarkActivity : ComponentActivity() {
     private lateinit var btnSelectResolutions: Button
     private lateinit var tvSelectedResolutions: TextView
     private lateinit var spinnerIterations: Spinner
+    private lateinit var switchOptimization: Switch
+    private lateinit var tvOptimizationInfo: TextView
 
     private val resultsAdapter = ResolutionResultAdapter()
     private val executor = Executors.newSingleThreadExecutor()
@@ -67,6 +70,10 @@ class YoloBenchmarkActivity : ComponentActivity() {
             conf: Float, iou: Float, inputSize: Int
         ): Array<FloatArray>
         external fun release()
+        
+        // Optimization mode control
+        external fun setOptimized(enabled: Boolean)
+        external fun isOptimized(): Boolean
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,8 +90,20 @@ class YoloBenchmarkActivity : ComponentActivity() {
         btnSelectResolutions = findViewById(R.id.btnSelectResolutions)
         tvSelectedResolutions = findViewById(R.id.tvSelectedResolutions)
         spinnerIterations = findViewById(R.id.spinnerIterations)
+        switchOptimization = findViewById(R.id.switchOptimization)
+        tvOptimizationInfo = findViewById(R.id.tvOptimizationInfo)
 
         findViewById<ImageButton>(R.id.btnBack).setOnClickListener { finish() }
+        
+        // Setup optimization toggle
+        switchOptimization.setOnCheckedChangeListener { _, isChecked ->
+            YoloBridge.setOptimized(isChecked)
+            tvOptimizationInfo.text = if (isChecked) {
+                "FP16, Winograd, SGEMM, Packing"
+            } else {
+                "Baseline mode (no optimizations)"
+            }
+        }
 
         // Setup iterations spinner
         val iterationOptions = listOf(1, 5, 10, 20, 50, 100)
@@ -239,11 +258,12 @@ class YoloBenchmarkActivity : ComponentActivity() {
             return
         }
 
-        // Show image info
+        // Show image info and mode
         val avgWidth = bitmaps.map { it.width }.average().toInt()
         val avgHeight = bitmaps.map { it.height }.average().toInt()
+        val modeStr = if (YoloBridge.isOptimized()) "OPTIMIZED" else "BASELINE"
         runOnUiThread {
-            tvStatus.text = "Loaded ${bitmaps.size} COCO images (${avgWidth}x${avgHeight})"
+            tvStatus.text = "[$modeStr] Loaded ${bitmaps.size} images (${avgWidth}x${avgHeight})"
         }
         Thread.sleep(500)
 

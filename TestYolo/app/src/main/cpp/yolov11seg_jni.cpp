@@ -171,3 +171,58 @@ Java_com_example_testyolo_MainActivity_00024YoloSegBridge_detectRgbaBoxesOnly(
     }
     return out;
 }
+
+// Returns detections with contour points: Array of FloatArray
+// Format: [x1, y1, x2, y2, score, cls, numContourPoints, px0, py0, px1, py1, ...]
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_example_testyolo_MainActivity_00024YoloSegBridge_detectRgbaWithContours(
+        JNIEnv* env, jobject /*thiz*/,
+        jobject rgbaBuffer,
+        jint width, jint height, jint rowStride, jint rotationDeg,
+        jfloat conf, jfloat iou) {
+
+    jclass floatArrCls = env->FindClass("[F");
+    
+    if (!g_seg) {
+        return env->NewObjectArray(0, floatArrCls, nullptr);
+    }
+
+    uint8_t* ptr = (uint8_t*)env->GetDirectBufferAddress(rgbaBuffer);
+    if (!ptr) {
+        return env->NewObjectArray(0, floatArrCls, nullptr);
+    }
+
+    std::vector<SegDet> dets = g_seg->detect_rgba(ptr, width, height, rowStride,
+                                                   rotationDeg, conf, iou);
+
+    jobjectArray out = env->NewObjectArray((jsize)dets.size(), floatArrCls, nullptr);
+
+    for (jsize i = 0; i < (jsize)dets.size(); ++i) {
+        const SegDet& d = dets[i];
+        
+        // Base fields: x1, y1, x2, y2, score, cls, numContourPoints (7 values)
+        // Then contour points as x,y pairs
+        int numContourPoints = (int)(d.contour.size() / 2);
+        int totalSize = 7 + (int)d.contour.size();
+        
+        std::vector<jfloat> tmp(totalSize);
+        tmp[0] = d.x1;
+        tmp[1] = d.y1;
+        tmp[2] = d.x2;
+        tmp[3] = d.y2;
+        tmp[4] = d.score;
+        tmp[5] = (float)d.cls;
+        tmp[6] = (float)numContourPoints;
+        
+        // Copy contour points
+        for (size_t j = 0; j < d.contour.size(); ++j) {
+            tmp[7 + j] = d.contour[j];
+        }
+        
+        jfloatArray row = env->NewFloatArray(totalSize);
+        env->SetFloatArrayRegion(row, 0, totalSize, tmp.data());
+        env->SetObjectArrayElement(out, i, row);
+        env->DeleteLocalRef(row);
+    }
+    return out;
+}

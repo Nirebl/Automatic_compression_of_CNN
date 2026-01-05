@@ -2,11 +2,84 @@
 #include <android/log.h>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 #define LOG_TAG "yolov11seg"
 
 static inline float sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
+}
+
+// Simple contour extraction using boundary tracing
+// Returns polygon points as pairs of (x, y) coordinates
+static std::vector<std::pair<int, int>> extract_contour(const uint8_t* mask, int w, int h) {
+    std::vector<std::pair<int, int>> contour;
+    if (!mask || w <= 0 || h <= 0) return contour;
+    
+    // Find all boundary points (pixels that have at least one non-mask neighbor)
+    std::vector<std::pair<int, int>> boundary;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            if (mask[y * w + x] == 0) continue;
+            
+            // Check if this is a boundary pixel
+            bool is_boundary = false;
+            for (int dy = -1; dy <= 1 && !is_boundary; ++dy) {
+                for (int dx = -1; dx <= 1 && !is_boundary; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    int nx = x + dx, ny = y + dy;
+                    if (nx < 0 || nx >= w || ny < 0 || ny >= h) {
+                        is_boundary = true;
+                    } else if (mask[ny * w + nx] == 0) {
+                        is_boundary = true;
+                    }
+                }
+            }
+            if (is_boundary) {
+                boundary.push_back({x, y});
+            }
+        }
+    }
+    
+    if (boundary.empty()) return contour;
+    
+    // Simple approach: order boundary points by angle from centroid
+    float cx = 0, cy = 0;
+    for (const auto& p : boundary) {
+        cx += p.first;
+        cy += p.second;
+    }
+    cx /= boundary.size();
+    cy /= boundary.size();
+    
+    // Sort by angle
+    std::sort(boundary.begin(), boundary.end(), [cx, cy](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+        float angle_a = std::atan2(a.second - cy, a.first - cx);
+        float angle_b = std::atan2(b.second - cy, b.first - cx);
+        return angle_a < angle_b;
+    });
+    
+    // Subsample to reduce point count (keep every Nth point, or at least 8 points)
+    int step = std::max(1, (int)boundary.size() / 32);
+    for (size_t i = 0; i < boundary.size(); i += step) {
+        contour.push_back(boundary[i]);
+    }
+    
+    // Ensure we have at least 4 points for a valid polygon
+    if (contour.size() < 4 && boundary.size() >= 4) {
+        contour = boundary;
+        // Limit to 64 points max
+        if (contour.size() > 64) {
+            std::vector<std::pair<int, int>> sampled;
+            int step2 = contour.size() / 64;
+            for (size_t i = 0; i < contour.size(); i += step2) {
+                sampled.push_back(contour[i]);
+            }
+            contour = sampled;
+        }
+    }
+    
+    return contour;
 }
 
 // Safe pixel read with rotation and bounds checking
@@ -356,7 +429,55 @@ std::vector<SegDet> YoloV11Seg::detect_rgba(const uint8_t* rgba, int srcW, int s
                             }
                         }
 
-                        det.mask[py * mw + px] = sigmoid(sum) > 0.5f ? 255 : 0;
+                        det.mask[py * mw + px] = sigmoid(sum) > 0.6f ? 255 : 0;
+                    }
+                }
+                
+                // Extract contour from mask and convert to original image coordinates
+                auto contour_pts = extract_contour(det.mask.data(), mw, mh);
+                if (!contour_pts.empty()) {
+                    det.contour.reserve(contour_pts.size() * 2);
+                    
+                    // Compute mask center for shrinking contour inward
+                    float mask_cx = mw / 2.0f;
+                    float mask_cy = mh / 2.0f;
+                    const float shrink_factor = 0.92f;  // Pull points 8% toward center
+                    
+                    for (const auto& pt : contour_pts) {
+                        // Shrink toward center to tighten the mask boundary
+                        float shrunk_x = mask_cx + (pt.first - mask_cx) * shrink_factor;
+                        float shrunk_y = mask_cy + (pt.second - mask_cy) * shrink_factor;
+                        
+                        // Convert from local mask coords to proto coords
+                        float proto_x = mx1 + shrunk_x;
+                        float proto_y = my1 + shrunk_y;
+                        
+                        // Convert from proto coords to model coords
+                        float model_x = proto_x / scale_x;
+                        float model_y = proto_y / scale_y;
+                        
+                        // Apply inverse letterbox transformation
+                        float orig_x = (model_x - pad_w / 2.0f) / scale;
+                        float orig_y = (model_y - pad_h / 2.0f) / scale;
+                        
+                        // Apply inverse rotation
+                        float final_x, final_y;
+                        if (rot == 0) {
+                            final_x = orig_x;
+                            final_y = orig_y;
+                        } else if (rot == 90) {
+                            final_x = srcW - 1 - orig_y;
+                            final_y = orig_x;
+                        } else if (rot == 180) {
+                            final_x = srcW - 1 - orig_x;
+                            final_y = srcH - 1 - orig_y;
+                        } else { // 270
+                            final_x = orig_y;
+                            final_y = srcH - 1 - orig_x;
+                        }
+                        
+                        det.contour.push_back(final_x);
+                        det.contour.push_back(final_y);
                     }
                 }
             }

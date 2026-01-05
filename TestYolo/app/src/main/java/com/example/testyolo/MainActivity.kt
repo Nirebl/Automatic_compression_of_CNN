@@ -82,6 +82,11 @@ class MainActivity : ComponentActivity() {
             width: Int, height: Int, rowStride: Int, rotationDeg: Int,
             conf: Float, iou: Float
         ): Array<FloatArray>  // [x1,y1,x2,y2,score,cls,mask_w,mask_h]
+        external fun detectRgbaWithContours(
+            rgba: ByteBuffer,
+            width: Int, height: Int, rowStride: Int, rotationDeg: Int,
+            conf: Float, iou: Float
+        ): Array<FloatArray>  // [x1,y1,x2,y2,score,cls,numPoints,px0,py0,px1,py1,...]
         external fun release()
     }
 
@@ -263,12 +268,12 @@ class MainActivity : ComponentActivity() {
                         DetectionLog.addAll(events)
                     }
                     Mode.YOLOSEG -> {
-                        val dets = YoloSegBridge.detectRgbaBoxesOnly(
+                        val dets = YoloSegBridge.detectRgbaWithContours(
                             buf, image.width, image.height, plane.rowStride,
                             image.imageInfo.rotationDegrees, 0.25f, 0.45f
                         )
                         overlay.post {
-                            overlay.updateSeg(
+                            overlay.updateSegWithContours(
                                 image.width, image.height, dets.toList(),
                                 image.imageInfo.rotationDegrees
                             )

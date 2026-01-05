@@ -9,6 +9,7 @@ struct SegDet {
     int cls;
     std::vector<uint8_t> mask;  // Binary mask for the bounding box region
     int mask_w, mask_h;          // Dimensions of the mask (matches bbox size)
+    std::vector<float> contour; // Polygon contour points (x0,y0, x1,y1, ...) in original image coords
 };
 
 class YoloV11Seg {
