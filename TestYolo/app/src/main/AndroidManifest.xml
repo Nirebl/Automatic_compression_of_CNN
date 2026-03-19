@@ -5,7 +5,6 @@
         android:name="android.hardware.camera"
         android:required="false" />
     <uses-permission android:name="android.permission.CAMERA"/>
-    <uses-permission android:name="android.permission.INTERNET"/>
 
     <application
         android:allowBackup="true"
@@ -30,12 +29,11 @@
             android:exported="false" />
 
         <activity
-            android:name=".YoloBenchmarkActivity"
-            android:exported="false" />
-
-        <activity
-            android:name=".YoloSegBenchmarkActivity"
-            android:exported="false" />
+            android:name=".CliBenchActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:launchMode="singleTask" />
 
     </application>
 </manifest>

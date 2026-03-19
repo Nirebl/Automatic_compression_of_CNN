@@ -9,15 +9,11 @@ struct SegDet {
     int cls;
     std::vector<uint8_t> mask;  // Binary mask for the bounding box region
     int mask_w, mask_h;          // Dimensions of the mask (matches bbox size)
-    std::vector<float> contour; // Polygon contour points (x0,y0, x1,y1, ...) in original image coords
 };
 
 class YoloV11Seg {
 public:
     bool load(AAssetManager* mgr, const char* param, const char* bin);
-    
-    // Load model for specific input size (e.g., yolov11n-seg_320.param)
-    bool loadForSize(AAssetManager* mgr, int inputSize);
 
     // Real-time camera path (RGBA + stride + rotation)
     // Returns detections with segmentation masks
@@ -27,8 +23,6 @@ public:
                                     float conf_thr, float iou_thr, int dst = 640);
 
     void clear() { net.clear(); }
-    
-    int getLoadedSize() const { return loadedInputSize; }
 
 private:
     ncnn::Net net;
@@ -36,6 +30,5 @@ private:
     int mask_proto_dim = 32;   // Number of mask prototype channels
     int mask_proto_h = 160;    // Prototype mask height (for 640 input)
     int mask_proto_w = 160;    // Prototype mask width
-    int loadedInputSize = 640;
 };
 

@@ -8,26 +8,27 @@ struct Det { float x1,y1,x2,y2,score; int cls; };
 class YoloV8 {
 public:
     bool load(AAssetManager* mgr, const char* param, const char* bin);
-    
-    // Load model for specific input size (e.g., yolov8n_320.param)
+
+    // Load model for specific input size (assets: yolov8n_320.param etc.)
     bool loadForSize(AAssetManager* mgr, int inputSize);
 
-    // Реалтайм-камерный путь (RGBA + stride + поворот)
+    // NEW: Load model from filesystem paths (adb push)
+    bool loadFromFile(const char* paramPath, const char* binPath, int inputSize, int numThreads);
+
     std::vector<Det> detect_rgba(const uint8_t* rgba,
                                  int srcW, int srcH, int rowStride,
                                  int rotationDeg,
                                  float conf_thr, float iou_thr, int dst=640);
 
-    void clear() {net.clear();}
-    
+    void clear() { net.clear(); }
+
     int getLoadedSize() const { return loadedInputSize; }
-    
-    // Optimization mode control
+
     void setOptimized(bool enabled) { useOptimizations = enabled; }
     bool isOptimized() const { return useOptimizations; }
 
 private:
     ncnn::Net net;
     int loadedInputSize = 640;
-    bool useOptimizations = true;  // Default: optimizations enabled
+    bool useOptimizations = true;
 };

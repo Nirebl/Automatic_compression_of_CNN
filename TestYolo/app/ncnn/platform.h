@@ -14,39 +14,40 @@
 #define NCNN_BENCHMARK 0
 #define NCNN_C_API 1
 #define NCNN_PLATFORM_API 1
+#define NCNN_WINXP 0
 #define NCNN_PIXEL 1
 #define NCNN_PIXEL_ROTATE 1
 #define NCNN_PIXEL_AFFINE 1
 #define NCNN_PIXEL_DRAWING 1
-#define NCNN_VULKAN 0
+#define NCNN_VULKAN 1
 #define NCNN_SIMPLEVK 1
 #define NCNN_SYSTEM_GLSLANG 0
 #define NCNN_RUNTIME_CPU 1
-#define NCNN_GNU_INLINE_ASM 1
-#define NCNN_AVX 0
-#define NCNN_XOP 0
-#define NCNN_FMA 0
-#define NCNN_F16C 0
-#define NCNN_AVX2 0
-#define NCNN_AVXVNNI 0
-#define NCNN_AVXVNNIINT8 0
-#define NCNN_AVXVNNIINT16 0
-#define NCNN_AVXNECONVERT 0
-#define NCNN_AVX512 0
-#define NCNN_AVX512VNNI 0
-#define NCNN_AVX512BF16 0
-#define NCNN_AVX512FP16 0
-#define NCNN_VFPV4 1
-#define NCNN_ARM82 1
-#define NCNN_ARM82DOT 1
-#define NCNN_ARM82FP16FML 1
-#define NCNN_ARM84BF16 1
-#define NCNN_ARM84I8MM 1
-#define NCNN_ARM86SVE 1
-#define NCNN_ARM86SVE2 1
-#define NCNN_ARM86SVEBF16 1
-#define NCNN_ARM86SVEI8MM 1
-#define NCNN_ARM86SVEF32MM 1
+#define NCNN_GNU_INLINE_ASM 0
+#define NCNN_AVX 1
+#define NCNN_XOP 1
+#define NCNN_FMA 1
+#define NCNN_F16C 1
+#define NCNN_AVX2 1
+#define NCNN_AVXVNNI 1
+#define NCNN_AVXVNNIINT8 1
+#define NCNN_AVXVNNIINT16 1
+#define NCNN_AVXNECONVERT 1
+#define NCNN_AVX512 1
+#define NCNN_AVX512VNNI 1
+#define NCNN_AVX512BF16 1
+#define NCNN_AVX512FP16 1
+#define NCNN_VFPV4 0
+#define NCNN_ARM82 0
+#define NCNN_ARM82DOT 0
+#define NCNN_ARM82FP16FML 0
+#define NCNN_ARM84BF16 0
+#define NCNN_ARM84I8MM 0
+#define NCNN_ARM86SVE 0
+#define NCNN_ARM86SVE2 0
+#define NCNN_ARM86SVEBF16 0
+#define NCNN_ARM86SVEI8MM 0
+#define NCNN_ARM86SVEF32MM 0
 #define NCNN_MSA 0
 #define NCNN_LSX 0
 #define NCNN_MMI 0
@@ -58,7 +59,8 @@
 #define NCNN_BF16 1
 #define NCNN_FORCE_INLINE 1
 
-#define NCNN_VERSION_STRING "1.0.20250916"
+#define NCNN_VERSION_STRING "1.0.20260113"
+#define NCNN_VERSION_NUMBER 20260113
 
 #include "ncnn_export.h"
 
@@ -67,9 +69,6 @@
 #if NCNN_THREADS
 #if defined _WIN32
 #define WIN32_LEAN_AND_MEAN
-#ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0501
-#endif
 #include <windows.h>
 #include <process.h>
 #else
@@ -87,7 +86,53 @@ namespace ncnn {
 
 #if NCNN_THREADS
 #if defined _WIN32
-#if _WIN32_WINNT > _WIN32_WINNT_WINXP // Windows Vista and later
+#if NCNN_WINXP
+class NCNN_EXPORT Mutex
+{
+public:
+    Mutex() { InitializeCriticalSection(&cs); }
+    ~Mutex() { DeleteCriticalSection(&cs); }
+    void lock() { EnterCriticalSection(&cs); }
+    void unlock() { LeaveCriticalSection(&cs); }
+private:
+    friend class ConditionVariable;
+    CRITICAL_SECTION cs;
+};
+
+class NCNN_EXPORT ConditionVariable
+{
+public:
+    ConditionVariable()
+    {
+        signal_event = CreateEvent(0, FALSE, FALSE, 0); // Auto-reset event for signal()
+        broadcast_event = CreateEvent(0, TRUE, FALSE, 0); // Manual-reset event for broadcast()
+    }
+    ~ConditionVariable()
+    {
+        CloseHandle(signal_event);
+        CloseHandle(broadcast_event);
+    }
+    void wait(Mutex& mutex)
+    {
+        mutex.unlock();
+        HANDLE events[2] = { signal_event, broadcast_event };
+        WaitForMultipleObjects(2, events, FALSE, INFINITE); // Wait for either signal or broadcast
+        mutex.lock();
+    }
+    void broadcast()
+    {
+        SetEvent(broadcast_event); // Wake all threads
+        ResetEvent(broadcast_event); // Reset after waking all threads
+    }
+    void signal()
+    {
+        SetEvent(signal_event); // Wake one thread
+    }
+private:
+    HANDLE signal_event;
+    HANDLE broadcast_event;
+};
+#else // NCNN_WINXP
 class NCNN_EXPORT Mutex
 {
 public:
@@ -111,56 +156,7 @@ public:
 private:
     CONDITION_VARIABLE condvar;
 };
-
-#else // Windows XP compatibility
-
-class NCNN_EXPORT Mutex
-{
-public:
-    Mutex() { InitializeCriticalSection(&cs); }
-    ~Mutex() { DeleteCriticalSection(&cs); }
-    void lock() { EnterCriticalSection(&cs); }
-    void unlock() { LeaveCriticalSection(&cs); }
-private:
-    friend class ConditionVariable;
-    CRITICAL_SECTION cs;
-};
-
-class NCNN_EXPORT ConditionVariable
-{
-public:
-    ConditionVariable() 
-    { 
-        signal_event = CreateEvent(0, FALSE, FALSE, 0); // Auto-reset event for signal()
-        broadcast_event = CreateEvent(0, TRUE, FALSE, 0); // Manual-reset event for broadcast()
-    }
-    ~ConditionVariable() 
-    { 
-        CloseHandle(signal_event); 
-        CloseHandle(broadcast_event); 
-    }
-    void wait(Mutex& mutex)
-    {
-        mutex.unlock();
-        HANDLE events[2] = { signal_event, broadcast_event };
-        WaitForMultipleObjects(2, events, FALSE, INFINITE); // Wait for either signal or broadcast
-        mutex.lock();
-    }
-    void broadcast() 
-    { 
-        SetEvent(broadcast_event); // Wake all threads
-        ResetEvent(broadcast_event); // Reset after waking all threads
-    }
-    void signal() 
-    { 
-        SetEvent(signal_event); // Wake one thread
-    }
-private:
-    HANDLE signal_event;
-    HANDLE broadcast_event;
-};
-
-#endif // _WIN32_WINNT > _WIN32_WINNT_WINXP
+#endif // NCNN_WINXP
 
 static unsigned __stdcall start_wrapper(void* args);
 class NCNN_EXPORT Thread
