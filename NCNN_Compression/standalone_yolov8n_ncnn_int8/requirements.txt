@@ -1,0 +1,4 @@
+ultralytics==8.4.24
+ncnn==1.0.20260114
+pnnx==20260112
+requests>=2.32,<3
