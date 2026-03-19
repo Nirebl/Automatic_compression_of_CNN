@@ -1,0 +1,1 @@
+.venv\Scripts\python.exe main.py --config xtrim/config.yaml --out outputs/xtrim_no_lr_test --max_candidates 8

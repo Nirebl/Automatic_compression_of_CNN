@@ -1,0 +1,200 @@
+model:
+  weights: yolov8m.pt
+  data: coco128.yaml
+  imgsz: 640
+  device: 0
+  task: detect
+
+trim:
+  channel_round: 8
+  min_channels: 8
+  exclude_head: true
+  exclude_name_regex: null
+
+  strategy: layerwise
+  max_prune_per_layer: 0.55
+  protect_last_n: 8
+
+latency:
+  backend: "android_app"
+  use_cache: true
+  force_rebench: false
+  cache_file: "bench_cache.json"
+  aggregate: "avg"
+  repeats: 1
+  scalar_alpha: 0.0
+  scalar_beta: 0.0
+
+devices:
+  - name: "phone1"
+    serial: "8379a6a3"
+    threads: 4
+    loops: 50
+    powersave: 0
+    gpu_device: 0
+    cooling_down: 1
+
+tools:
+  onnx2ncnn: "C:/Projects/ITMO/Diploma/NCNN_Compression/ncnn-20250916-windows-vs2022/x64/bin/onnx2ncnn.exe"
+  ncnnoptimize: "C:/Projects/ITMO/Diploma/NCNN_Compression/ncnn-20260113-windows-vs2022/ncnn-20260113-windows-vs2022/x64/bin/ncnnoptimize.exe"
+  ncnn2table: "C:/Projects/ITMO/Diploma/NCNN_Compression/ncnn-20260113-windows-vs2022/ncnn-20260113-windows-vs2022/x64/bin/ncnn2table.exe"
+  ncnn2int8: "C:/Projects/ITMO/Diploma/NCNN_Compression/ncnn-20260113-windows-vs2022/ncnn-20260113-windows-vs2022/x64/bin/ncnn2int8.exe"
+
+train:
+  short_epochs: 50
+  lr: 0.0002
+  kd_enabled: true
+
+kd:
+  enabled: true
+  teacher: null
+  num_feature_layers: 5
+  lambda_feat: 5.0
+  lambda_head: 2.0
+  lambda_bn: 0.00001
+  batch: 8
+  workers: 2
+  max_train_batches: 0
+
+export:
+  opset: 18
+  bench_shape: "[640,640,3]"
+
+ptq:
+  enabled: true
+  imagelist: "calib.txt"
+  mean: "0,0,0"
+  norm: "0.00392156862,0.00392156862,0.00392156862"
+  shape: "[640,640,3]"
+  pixel: "RGB"
+  thread: 8
+  method: "kl"
+
+lowrank:
+  enabled: false
+  energy_threshold: 0.95
+  min_channels: 32
+  exclude_head: true
+  exclude_stem: true
+  max_layers: 0
+  bn_recalib_batches: 20
+  finetune_epochs: 0
+  lowrank_1x1: false
+
+sparse_1x1:
+  enabled: true
+  sparsity: 0.7
+  method: "l1"
+  min_channels: 16
+
+dilated:
+  enabled: false
+  rates: [1, 2]
+  target_layers: []
+  target_n_blocks: 4
+  exclude_head: true
+
+gumbel_choice:
+  enabled: false
+  tau_start: 5.0
+  tau_end: 0.5
+  tau_schedule: "exp"
+  hard: false
+  lowrank_rank: 8
+  sparse_sparsity: 0.5
+  min_channels: 16
+
+latency_lut:
+  enabled: false
+  lut_path: "assets/lut_sample.json"
+  budget_ms: 400.0
+  lambda_lat: 0.01
+  macs_per_ms: 100000000
+  log_every_n_batches: 50
+
+operator_choice:
+  enabled: false
+  default: "dense"
+  allow_sparse: false
+  allow_lowrank: true
+  lowrank_rank: 32
+  sparse_sparsity: 0.5
+  sparse_method: "l1"
+  min_channels: 128
+
+search_space:
+  width_mult: [ 1 ]
+  prune_ratio: [ 0 ]
+  lowrank_rank: [ 0 ]
+  sparse_1x1: [ 0 ]
+
+eval:
+  conf: 0.001
+  iou: 0.6
+  max_det: 300
+  half: false
+  dnn: false
+  rect: false
+  split: val
+  batch: 8
+  workers: 4
+  verbose: false
+  plots: false
+  augment: false
+  agnostic_nms: false
+
+onnx_ptq:
+  enabled: true
+  calib_split: train
+  calib_max_images: 256
+  per_channel: true
+  quant_format: qdq
+  activation_type: quint8
+  weight_type: qint8
+  calibrate_method: entropy
+
+qat:
+  enabled: true
+  acc_drop_threshold: 0.03
+  epochs: 20
+  lr: 0.00005
+  max_train_batches: 0
+  bits_w: 8
+  bits_a: 8
+
+android_demo:
+  enabled: false
+  sample_image: "assets/demo.jpg"
+  imgsz: 640
+  conf: 0.25
+  iou: 0.6
+  max_det: 100
+
+search:
+  method: "grid"
+  seed: 42
+  init_random: 6
+  population: 24
+  offspring: 12
+  mutation_prob: 0.35
+  crossover_prob: 0.9
+  tournament_k: 2
+
+android_app_bench:
+  enabled: true
+  package: "com.example.testyolo"
+  activity: ".CliBenchActivity"
+  dataset: "cifar"
+  imgsz: 640
+  loops: 50
+  warmup: 10
+  threads: 4
+  conf: 0.25
+  iou: 0.45
+  max_det: 100
+  optimized: true
+  result_tag: "XTRIM_RESULT"
+  timeout_sec: 180
+  poll_interval_sec: 0.6
+  clear_logcat: true
+  remote_dir: "/data/local/tmp"
