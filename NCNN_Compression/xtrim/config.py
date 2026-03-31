@@ -26,6 +26,7 @@ from .types import (
     GumbelChoiceConfig,
     LowRankConfig,
     DilatedConfig,
+    OrtAndroidBenchConfig,
 )
 
 
@@ -50,6 +51,7 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     AndroidDemoConfig,
     SearchConfig,
     AndroidAppBenchConfig,
+    OrtAndroidBenchConfig,
     OperatorChoiceConfig,
     Dict[str, str],
     LatencyLUTConfig,
@@ -82,6 +84,8 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     gumbel_cfg = GumbelChoiceConfig(**cfg.get("gumbel_choice", {}))
     lowrank_cfg = LowRankConfig(**cfg.get("lowrank", {}))
 
+    ort_android_bench_cfg = OrtAndroidBenchConfig(**cfg.get("ort_android_bench", {}))
+
     dilated_raw = dict(cfg.get("dilated", {}))
     if "rates" in dilated_raw:
         dilated_raw["rates"] = tuple(dilated_raw["rates"])
@@ -106,6 +110,7 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
         android_demo_cfg,
         search_cfg,
         android_app_bench_cfg,
+        ort_android_bench_cfg,
         op_choice_cfg,
         op_choice_plan,
         lut_cfg,

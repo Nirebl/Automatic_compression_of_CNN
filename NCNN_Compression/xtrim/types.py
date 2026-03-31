@@ -277,3 +277,23 @@ class AndroidAppBenchConfig:
     poll_interval_sec: float = 0.6
     clear_logcat: bool = True
     remote_dir: str = "/data/local/tmp"
+
+@dataclass(frozen=True)
+class OrtAndroidBenchConfig:
+    enabled: bool = False
+    package: str = "com.example.testyolo"
+    activity: str = ".CliBenchActivity"
+    dataset: str = "coco"
+    imgsz: int = 640
+    loops: int = 50
+    warmup: int = 10
+    threads: int = 4
+    conf: float = 0.25
+    iou: float = 0.45
+    max_det: int = 100
+    provider: str = "xnnpack"   # xnnpack | nnapi
+    result_tag: str = "XTRIM_RESULT"
+    timeout_sec: int = 180
+    poll_interval_sec: float = 0.6
+    clear_logcat: bool = True
+    remote_dir: str = "/data/local/tmp"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import dataclasses
 from pathlib import Path
 from typing import List, Optional, Set
 
@@ -9,21 +8,45 @@ from .types import HistoryItem, CandidateConfig, Metrics
 from .pareto import avg_latency, pareto_front
 
 
+def _is_reference_baseline(h: HistoryItem) -> bool:
+    return bool(h.extra.get("is_reference_baseline", False))
+
+
+def _candidate_history(history: List[HistoryItem]) -> List[HistoryItem]:
+    return [h for h in history if not _is_reference_baseline(h)]
+
+
+def _reference_baseline(history: List[HistoryItem]) -> Optional[HistoryItem]:
+    refs = [h for h in history if _is_reference_baseline(h) and not h.extra.get("failed", False)]
+    return refs[0] if refs else None
+
+
 def _baseline_size(history: List[HistoryItem]) -> Optional[int]:
+    ref = _reference_baseline(history)
+    if ref is not None:
+        return ref.metrics.size_bytes
+
     for h in history:
-        if (not h.extra.get("failed", False)
-                and h.candidate.width_mult == 1.0
-                and h.candidate.prune_ratio == 0.0
-                and h.candidate.sparse_1x1 == 0.0
-                and h.candidate.lowrank_rank == 0):
+        if (
+            not h.extra.get("failed", False)
+            and h.candidate.width_mult == 1.0
+            and h.candidate.prune_ratio == 0.0
+            and h.candidate.sparse_1x1 == 0.0
+            and h.candidate.lowrank_rank == 0
+        ):
             return h.metrics.size_bytes
     return None
 
 
 def _find_baseline_acc(history: List[HistoryItem]) -> float:
+    ref = _reference_baseline(history)
+    if ref is not None:
+        return float(ref.metrics.acc)
+
     valid = [h for h in history if not h.extra.get("failed", False)]
     exact = [
-        h for h in valid
+        h
+        for h in valid
         if h.candidate.width_mult == 1.0
         and h.candidate.prune_ratio == 0.0
         and h.candidate.sparse_1x1 == 0.0
@@ -31,12 +54,14 @@ def _find_baseline_acc(history: List[HistoryItem]) -> float:
     ]
     if exact:
         return max(h.metrics.acc for h in exact)
+
     base = [
         h for h in valid
         if h.candidate.width_mult == 1.0 and h.candidate.prune_ratio == 0.0
     ]
     if base:
         return max(h.metrics.acc for h in base)
+
     return max(h.metrics.acc for h in valid) if valid else 0.0
 
 
@@ -49,8 +74,11 @@ def print_results_table(
         print("[results] No candidates evaluated.")
         return
 
-    ok_history     = [h for h in history if not h.extra.get("failed", False)]
-    failed_history = [h for h in history if h.extra.get("failed", False)]
+    ref_item = _reference_baseline(history)
+
+    candidate_history = _candidate_history(history)
+    ok_history = [h for h in candidate_history if not h.extra.get("failed", False)]
+    failed_history = [h for h in candidate_history if h.extra.get("failed", False)]
 
     pareto_set: Set[str] = {h.candidate.tag for h in pareto_front(ok_history)}
 
@@ -61,64 +89,80 @@ def print_results_table(
 
     sorted_history = sorted(ok_history, key=lambda h: -h.metrics.acc)
 
-    W_TAG   = max(24, max(len(h.candidate.tag) for h in history))
-    W_CFG   = 16
-    W_MAP   = 8
-    W_DMAP  = 8
-    W_PTQ   = 8
+    W_TAG = max(24, max(len(h.candidate.tag) for h in candidate_history) if candidate_history else 24)
+    W_CFG = 16
+    W_MAP = 8
+    W_DMAP = 8
+    W_PTQ = 8
     W_DINT8 = 7
-    W_QAT   = 8
-    W_LAT   = 10
-    W_SIZE  = 9
+    W_QAT = 8
+    W_LAT = 10
+    W_SIZE = 9
     W_COMPR = 7
-    W_P     = 1
+    W_P = 1
 
     def _col(label: str, w: int, align: str = ">") -> str:
         return f"{label:{align}{w}}"
 
     header_parts = [
         "  #",
-        _col("Candidate",  W_TAG,   "<"),
-        _col("Config",     W_CFG,   "<"),
-        _col("mAP",        W_MAP),
-        _col("Δ mAP",      W_DMAP),
-        _col("mAP PTQ",    W_PTQ),
-        _col("Δ INT8",     W_DINT8),
-        _col("mAP QAT",    W_QAT),
-        _col("Lat (ms)",   W_LAT),
-        _col("Size (MB)",  W_SIZE),
-        _col("Compr×",     W_COMPR),
-        _col("P",          W_P),
+        _col("Candidate", W_TAG, "<"),
+        _col("Config", W_CFG, "<"),
+        _col("mAP", W_MAP),
+        _col("Δ mAP", W_DMAP),
+        _col("mAP PTQ", W_PTQ),
+        _col("Δ INT8", W_DINT8),
+        _col("mAP QAT", W_QAT),
+        _col("Lat (ms)", W_LAT),
+        _col("Size (MB)", W_SIZE),
+        _col("Compr×", W_COMPR),
+        _col("P", W_P),
     ]
     header = "  ".join(header_parts)
-    sep    = "-" * len(header)
+    sep = "-" * len(header)
     border = "=" * len(header)
 
     print(f"\n{border}")
     print(f"  {title}")
-    print(f"  Baseline mAP (FP32): {baseline_acc:.4f}  |  "
-          f"Pareto-optimal: {len(pareto_set)} / {len(ok_history)}"
-          + (f"  |  Failed: {len(failed_history)}" if failed_history else ""))
+
+    if ref_item is not None:
+        ref_lat = avg_latency(ref_item.metrics.latency_ms)
+        ref_lat_str = f"{ref_lat:.1f}" if ref_lat != float('inf') else "---"
+        ref_size_mb = ref_item.metrics.size_bytes / 1024 / 1024
+        print(
+            f"  Reference baseline (raw FP32): {baseline_acc:.4f}  |  "
+            f"Lat: {ref_lat_str} ms  |  "
+            f"Size: {ref_size_mb:.1f} MB  |  "
+            f"Pareto-optimal: {len(pareto_set)} / {len(ok_history)}"
+            + (f"  |  Failed: {len(failed_history)}" if failed_history else "")
+        )
+    else:
+        print(
+            f"  Baseline mAP (FP32): {baseline_acc:.4f}  |  "
+            f"Pareto-optimal: {len(pareto_set)} / {len(ok_history)}"
+            + (f"  |  Failed: {len(failed_history)}" if failed_history else "")
+        )
+
     print(border)
     print(header)
     print(sep)
 
     for i, h in enumerate(sorted_history, 1):
-        cand  = h.candidate
-        m     = h.metrics
+        cand = h.candidate
+        m = h.metrics
         extra = h.extra
 
         config_str = f"w={cand.width_mult:.2f} p={cand.prune_ratio:.2f}"
 
         lat = avg_latency(m.latency_ms)
-        lat_str  = f"{lat:.1f}" if lat != float("inf") else "---"
-        size_mb  = m.size_bytes / 1024 / 1024
+        lat_str = f"{lat:.1f}" if lat != float("inf") else "---"
+        size_mb = m.size_bytes / 1024 / 1024
 
-        acc       = m.acc
+        acc = m.acc
         delta_map = acc - baseline_acc
 
-        ptq_acc   = extra.get("acc_onnx_int8")
-        ptq_str   = f"{ptq_acc:.4f}" if ptq_acc is not None else "---"
+        ptq_acc = extra.get("acc_onnx_int8")
+        ptq_str = f"{ptq_acc:.4f}" if ptq_acc is not None else "---"
 
         drop_int8 = extra.get("acc_drop_int8")
         if drop_int8 is not None:
@@ -127,7 +171,7 @@ def print_results_table(
             delta_int8_str = "---"
 
         qat_int8 = extra.get("acc_onnx_int8_after_qat")
-        qat_str  = f"{qat_int8:.4f}" if qat_int8 is not None else "---"
+        qat_str = f"{qat_int8:.4f}" if qat_int8 is not None else "---"
 
         if baseline_size and baseline_size > 0 and m.size_bytes > 0:
             compr = baseline_size / m.size_bytes
@@ -139,22 +183,22 @@ def print_results_table(
 
         row_parts = [
             f"{i:>3}",
-            _col(cand.tag,      W_TAG,   "<"),
-            _col(config_str,    W_CFG,   "<"),
-            _col(f"{acc:.4f}",  W_MAP),
+            _col(cand.tag, W_TAG, "<"),
+            _col(config_str, W_CFG, "<"),
+            _col(f"{acc:.4f}", W_MAP),
             _col(f"{delta_map:+.4f}", W_DMAP),
-            _col(ptq_str,       W_PTQ),
+            _col(ptq_str, W_PTQ),
             _col(delta_int8_str, W_DINT8),
-            _col(qat_str,       W_QAT),
-            _col(lat_str,       W_LAT),
+            _col(qat_str, W_QAT),
+            _col(lat_str, W_LAT),
             _col(f"{size_mb:.1f}", W_SIZE),
-            _col(compr_str,     W_COMPR),
-            _col(pareto_flag,   W_P),
+            _col(compr_str, W_COMPR),
+            _col(pareto_flag, W_P),
         ]
         print("  ".join(row_parts))
 
     print(sep)
-    print(f"  * = Pareto-optimal  |  Δ mAP vs baseline  |  Δ INT8 = PTQ - FP32  |  Compr× = baseline_size / candidate_size")
+    print("  * = Pareto-optimal  |  Δ mAP vs raw reference baseline  |  Δ INT8 = PTQ - FP32  |  Compr× = baseline_size / candidate_size")
 
     if failed_history:
         print(f"\n  {'FAILED CANDIDATES':}")
@@ -179,6 +223,7 @@ def plot_pareto(
         print("[plot_pareto] matplotlib not installed. Run: pip install matplotlib")
         return
 
+    history = _candidate_history(history)
     ok_history = [h for h in history if not h.extra.get("failed", False)]
     if not ok_history:
         print("[plot_pareto] No successful candidates to plot.")
@@ -198,14 +243,16 @@ def plot_pareto(
         compr = baseline_size / h.metrics.size_bytes if h.metrics.size_bytes > 0 else 1.0
 
         is_pareto = h.candidate.tag in pareto_set
-        color  = "#e74c3c" if is_pareto else "#3498db"
+        color = "#e74c3c" if is_pareto else "#3498db"
         marker = "*" if is_pareto else "o"
         zorder = 5 if is_pareto else 3
 
         bubble = max(30, size_mb * 2)
 
-        ax.scatter(lat, acc, s=bubble, c=color, marker=marker,
-                   alpha=0.85, zorder=zorder, edgecolors="white", linewidths=0.5)
+        ax.scatter(
+            lat, acc, s=bubble, c=color, marker=marker,
+            alpha=0.85, zorder=zorder, edgecolors="white", linewidths=0.5
+        )
         ax.annotate(
             f"{h.candidate.tag}\n({compr:.1f}×)",
             (lat, acc),
@@ -220,7 +267,7 @@ def plot_pareto(
         Line2D([0], [0], marker="*", color="w", markerfacecolor="#e74c3c",
                markersize=12, label="Pareto-optimal"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="#3498db",
-               markersize=9,  label="Dominated"),
+               markersize=9, label="Dominated"),
     ]
     ax.legend(handles=legend_elements, loc="lower right", fontsize=9)
 
@@ -245,13 +292,15 @@ def load_history_jsonl(path: Path) -> List[HistoryItem]:
         line = line.strip()
         if not line:
             continue
-        rec  = json.loads(line)
+        rec = json.loads(line)
         cand = CandidateConfig(**rec["candidate"])
-        met  = Metrics(**rec["metrics"])
-        items.append(HistoryItem(
-            candidate=cand,
-            metrics=met,
-            artifacts_dir=rec["artifacts_dir"],
-            extra=rec.get("extra", {}),
-        ))
+        met = Metrics(**rec["metrics"])
+        items.append(
+            HistoryItem(
+                candidate=cand,
+                metrics=met,
+                artifacts_dir=rec["artifacts_dir"],
+                extra=rec.get("extra", {}),
+            )
+        )
     return items

@@ -58,6 +58,7 @@ def main() -> int:
         android_demo_cfg,
         search_cfg,
         android_app_bench_cfg,
+        ort_android_bench_cfg,
         op_choice_cfg,
         op_choice_plan,
         lut_cfg,
@@ -154,6 +155,7 @@ def main() -> int:
         quantize_onnx_fn=quantize_onnx_fn,
         save_student_pt_fn=save_student_torchscript,
         android_app_bench_cfg=android_app_bench_cfg,
+        ort_android_bench_cfg=ort_android_bench_cfg,
     )
 
     history = orch.run(max_candidates=args.max_candidates)
