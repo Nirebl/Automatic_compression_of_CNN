@@ -161,6 +161,11 @@ class TrimConfig:
     max_prune_per_layer: Optional[float] = None
     protect_last_n: int = 0
 
+    skip_inner_m: bool = True
+    skip_cv1_if_parent_has_m: bool = True
+    include_inner_m_regex: Optional[str] = None
+    adapt_c2f_for_pruning: bool = False
+
 
 @dataclass(frozen=True)
 class LatencyConfig:

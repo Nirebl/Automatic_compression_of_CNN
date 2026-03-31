@@ -35,6 +35,7 @@ from ..trim.gumbel_choice import (
 )
 from ..trim.dilated import apply_dilation
 from .kd_finetune import finetune_with_kd
+from .pruning_adapters import replace_c2f_with_prunable
 from types import SimpleNamespace
 
 
@@ -117,8 +118,75 @@ def build_ultralytics_candidate(
 
     import torch
 
+    def _normalize_exclude_name_regex(v):
+        if v is None or v is False or v == "":
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        raise TypeError(
+            f"trim.exclude_name_regex must be null/false or a regex string, got {type(v).__name__}"
+        )
+
+    def _normalize_include_inner_m_regex(v):
+        if v is None or v is False or v == "":
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        raise TypeError(
+            f"trim.include_inner_m_regex must be null/false or a regex string, got {type(v).__name__}"
+        )
+
+    def _count_params(model) -> int:
+        return sum(p.numel() for p in model.parameters())
+
+    def _count_trainable_params(model) -> int:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    def _top_param_modules(model, topk: int = 20):
+        rows = []
+        for name, module in model.named_modules():
+            own_params = sum(p.numel() for p in module.parameters(recurse=False))
+            if own_params > 0:
+                rows.append((name, module.__class__.__name__, own_params))
+        rows.sort(key=lambda x: x[2], reverse=True)
+        return rows[:topk]
+
+    def _print_param_snapshot(model, label: str, topk: int = 20):
+        total = _count_params(model)
+        trainable = _count_trainable_params(model)
+        print(f"[params] {label}: total={total:,} trainable={trainable:,}")
+
+        top_rows = _top_param_modules(model, topk=topk)
+        if top_rows:
+            print(f"[params] {label}: top-{len(top_rows)} modules by own parameter count")
+            for i, (name, cls_name, n) in enumerate(top_rows, 1):
+                mod_name = name if name else "<root>"
+                print(f"  [{i:02d}] {mod_name:<40} {cls_name:<20} {n:,}")
+
+        return {
+            "label": label,
+            "total_params": total,
+            "trainable_params": trainable,
+            "top_modules": [
+                {"name": name if name else "<root>", "type": cls_name, "params": int(n)}
+                for name, cls_name, n in top_rows
+            ],
+        }
+
     yolo = YOLO(model_cfg.weights)
     torch_model = yolo.model
+
+    adapt_c2f_for_pruning = bool(getattr(trim_cfg, "adapt_c2f_for_pruning", False))
+    will_prune = (
+            float(getattr(cand, "width_mult", 1.0)) < 1.0
+            or float(getattr(cand, "prune_ratio", 0.0)) > 0.0
+    )
+
+    if adapt_c2f_for_pruning and will_prune:
+        replaced = replace_c2f_with_prunable(torch_model, verbose=True)
+        print(f"[adapt] total C2f blocks replaced: {replaced}")
 
     dev = _torch_device_from_ultralytics_device(str(model_cfg.device))
     torch_model.to(dev).eval()
@@ -127,6 +195,30 @@ def build_ultralytics_candidate(
 
     all_stats = {}
 
+    exclude_name_regex = _normalize_exclude_name_regex(
+        getattr(trim_cfg, "exclude_name_regex", None)
+    )
+    include_inner_m_regex = _normalize_include_inner_m_regex(
+        getattr(trim_cfg, "include_inner_m_regex", None)
+    )
+    skip_inner_m = bool(getattr(trim_cfg, "skip_inner_m", True))
+    skip_cv1_if_parent_has_m = bool(getattr(trim_cfg, "skip_cv1_if_parent_has_m", True))
+
+    all_stats["trim_cfg_effective"] = {
+        "exclude_head": bool(trim_cfg.exclude_head),
+        "exclude_name_regex": exclude_name_regex,
+        "strategy": str(getattr(trim_cfg, "strategy", "layerwise")),
+        "max_prune_per_layer": getattr(trim_cfg, "max_prune_per_layer", None),
+        "protect_last_n": int(getattr(trim_cfg, "protect_last_n", 0) or 0),
+        "skip_inner_m": skip_inner_m,
+        "skip_cv1_if_parent_has_m": skip_cv1_if_parent_has_m,
+        "include_inner_m_regex": include_inner_m_regex,
+        "adapt_c2f_for_pruning": adapt_c2f_for_pruning,
+    }
+
+    all_stats["params_initial"] = _print_param_snapshot(torch_model, "initial", topk=20)
+    params_before_any = all_stats["params_initial"]["total_params"]
+
     width_mult = float(getattr(cand, "width_mult", 1.0))
     if width_mult < 1.0:
         width_prune_ratio = 1.0 - width_mult
@@ -134,30 +226,51 @@ def build_ultralytics_candidate(
         strategy = str(getattr(trim_cfg, "strategy", "layerwise"))
         protect_last_n = int(getattr(trim_cfg, "protect_last_n", 0) or 0)
 
-        try:
-            width_stats = structured_trim_yolo(
-                torch_model,
-                example_input=x,
-                prune_ratio=width_prune_ratio,
-                channel_round=int(trim_cfg.channel_round),
-                min_channels=int(trim_cfg.min_channels),
-                exclude_head=bool(trim_cfg.exclude_head),
-                exclude_name_regex=trim_cfg.exclude_name_regex,
-                strategy=strategy,
-                max_prune_per_layer=width_prune_ratio,
-                protect_last_n=protect_last_n,
-                verbose=True,
-                importance_mode="uniform",
-            )
-            all_stats["width_scale"] = {
-                "width_mult": width_mult,
-                "layers_pruned": width_stats.get("layers_pruned", 0),
-                "channels_pruned": width_stats.get("channels_pruned", 0),
-            }
-            print(f"[build] Width scaling: {width_stats.get('layers_pruned', 0)} layers, {width_stats.get('channels_pruned', 0)} channels removed")
-        except Exception as e:
-            print(f"[build] Warning: width_mult failed: {e}")
-            all_stats["width_scale"] = {"error": str(e), "width_mult": width_mult}
+        params_before_width = _count_params(torch_model)
+
+        width_stats = structured_trim_yolo(
+            torch_model,
+            example_input=x,
+            prune_ratio=width_prune_ratio,
+            channel_round=int(trim_cfg.channel_round),
+            min_channels=int(trim_cfg.min_channels),
+            exclude_head=bool(trim_cfg.exclude_head),
+            exclude_name_regex=exclude_name_regex,
+            strategy=strategy,
+            max_prune_per_layer=width_prune_ratio,
+            protect_last_n=protect_last_n,
+            verbose=True,
+            importance_mode="uniform",
+            skip_inner_m=skip_inner_m,
+            skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+            include_inner_m_regex=include_inner_m_regex,
+        )
+
+        params_after_width = _count_params(torch_model)
+        width_comp = params_before_width / max(1, params_after_width)
+
+        all_stats["width_scale"] = {
+            "width_mult": width_mult,
+            "prune_ratio_equivalent": width_prune_ratio,
+            "layers_pruned": width_stats.get("layers_pruned", 0),
+            "channels_pruned": width_stats.get("channels_pruned", 0),
+            "params_before": int(params_before_width),
+            "params_after": int(params_after_width),
+            "compression_ratio": float(width_comp),
+            "raw_stats": width_stats,
+        }
+
+        print(
+            f"[build] Width scaling: "
+            f"{width_stats.get('layers_pruned', 0)} layers, "
+            f"{width_stats.get('channels_pruned', 0)} channels removed, "
+            f"params {params_before_width:,} -> {params_after_width:,} "
+            f"({width_comp:.2f}x)"
+        )
+
+        all_stats["params_after_width"] = _print_param_snapshot(
+            torch_model, "after_width_mult", topk=20
+        )
 
     if cand.prune_ratio > 0.0:
         print(f"[build] Applying prune_ratio={cand.prune_ratio} (BN-gamma importance)")
@@ -165,38 +278,50 @@ def build_ultralytics_candidate(
         max_prune_per_layer = getattr(trim_cfg, "max_prune_per_layer", None)
         protect_last_n = int(getattr(trim_cfg, "protect_last_n", 0) or 0)
 
-        try:
-            stats = structured_trim_yolo(
-                torch_model,
-                example_input=x,
-                prune_ratio=float(cand.prune_ratio),
-                channel_round=int(trim_cfg.channel_round),
-                min_channels=int(trim_cfg.min_channels),
-                exclude_head=bool(trim_cfg.exclude_head),
-                exclude_name_regex=trim_cfg.exclude_name_regex,
-                strategy=strategy,
-                max_prune_per_layer=max_prune_per_layer,
-                protect_last_n=protect_last_n,
-                verbose=True,
-                importance_mode="bn_gamma",
-            )
-            all_stats["bn_prune"] = stats
-        except TypeError:
-            stats = structured_trim_yolo(
-                torch_model,
-                example_input=x,
-                prune_ratio=float(cand.prune_ratio),
-                channel_round=int(trim_cfg.channel_round),
-                min_channels=int(trim_cfg.min_channels),
-                exclude_head=bool(trim_cfg.exclude_head),
-                exclude_name_regex=trim_cfg.exclude_name_regex,
-                verbose=True,
-            )
-            all_stats["bn_prune"] = stats
+        params_before_bn = _count_params(torch_model)
+
+        stats = structured_trim_yolo(
+            torch_model,
+            example_input=x,
+            prune_ratio=float(cand.prune_ratio),
+            channel_round=int(trim_cfg.channel_round),
+            min_channels=int(trim_cfg.min_channels),
+            exclude_head=bool(trim_cfg.exclude_head),
+            exclude_name_regex=exclude_name_regex,
+            strategy=strategy,
+            max_prune_per_layer=max_prune_per_layer,
+            protect_last_n=protect_last_n,
+            verbose=True,
+            importance_mode="bn_gamma",
+            skip_inner_m=skip_inner_m,
+            skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+            include_inner_m_regex=include_inner_m_regex,
+        )
+
+        params_after_bn = _count_params(torch_model)
+        bn_comp = params_before_bn / max(1, params_after_bn)
+        total_comp = params_before_any / max(1, params_after_bn)
+
+        stats = dict(stats or {})
+        stats["params_before"] = int(params_before_bn)
+        stats["params_after"] = int(params_after_bn)
+        stats["compression_ratio_stage"] = float(bn_comp)
+        stats["compression_ratio_total"] = float(total_comp)
+
+        all_stats["bn_prune"] = stats
+
+        print(
+            f"[build] BN prune: "
+            f"params {params_before_bn:,} -> {params_after_bn:,} "
+            f"(stage {bn_comp:.2f}x, total {total_comp:.2f}x)"
+        )
 
         with torch.no_grad():
             _ = torch_model(x)
 
+        all_stats["params_after_bn_prune"] = _print_param_snapshot(
+            torch_model, "after_prune_ratio", topk=20
+        )
 
         setattr(yolo, "_xtrim_trim_stats", stats)
 
@@ -230,7 +355,7 @@ def build_ultralytics_candidate(
         lr_energy_thresh = float(lr_cfg.energy_threshold) if lr_cfg else 0.0
         lr_min_channels = int(lr_cfg.min_channels) if lr_cfg else 32
         lr_max_layers = int(lr_cfg.max_layers) if lr_cfg else 0
-        lr_exclude_regex = trim_cfg.exclude_name_regex
+        lr_exclude_regex = exclude_name_regex
 
         effective_rank = 0 if lr_energy_thresh > 0.0 else lowrank_rank
 
@@ -294,7 +419,7 @@ def build_ultralytics_candidate(
                 sparsity=sparse_amount,
                 method="l1",
                 exclude_head=bool(trim_cfg.exclude_head),
-                exclude_name_regex=trim_cfg.exclude_name_regex,
+                exclude_name_regex=exclude_name_regex,
                 min_channels=16,
                 verbose=True,
             )
@@ -322,7 +447,7 @@ def build_ultralytics_candidate(
                 cfg_plan=op_choice_plan or {},
                 default=op_choice_cfg.default,
                 exclude_head=bool(trim_cfg.exclude_head),
-                exclude_name_regex=trim_cfg.exclude_name_regex,
+                exclude_name_regex=exclude_name_regex,
                 min_channels=int(op_choice_cfg.min_channels),
             )
             op_stats = apply_operator_plan(
@@ -354,7 +479,7 @@ def build_ultralytics_candidate(
                 sparsity=float(gumbel_cfg.sparse_sparsity),
                 hard=bool(gumbel_cfg.hard),
                 exclude_head=bool(trim_cfg.exclude_head),
-                exclude_name_regex=trim_cfg.exclude_name_regex,
+                exclude_name_regex=exclude_name_regex,
                 min_channels=int(gumbel_cfg.min_channels),
                 verbose=True,
             )
@@ -365,6 +490,8 @@ def build_ultralytics_candidate(
 
     with torch.no_grad():
         _ = torch_model(x)
+
+    all_stats["params_final"] = _print_param_snapshot(torch_model, "final", topk=20)
 
     yolo.model = torch_model
     if hasattr(yolo, "_model"):

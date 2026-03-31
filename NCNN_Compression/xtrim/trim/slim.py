@@ -45,16 +45,35 @@ def _should_skip_prune(
     *,
     skip_inner_m: bool,
     skip_cv1_if_parent_has_m: bool,
+    include_inner_m_regex: Optional[str] = None,
 ) -> bool:
-    if skip_inner_m and re.search(r"\.m\.\d+\.", name):
-        return True
+    include_inner_re = re.compile(include_inner_m_regex) if include_inner_m_regex else None
+
+    is_inner_m = re.search(r"\.m\.\d+\.", name) is not None
+    if skip_inner_m and is_inner_m:
+        if include_inner_re is None or not include_inner_re.search(name):
+            return True
+
+    # КРИТИЧНО:
+    # parent.cv2 у блока, у которого есть .m, — это агрегационный conv после cat(...).
+    # Его нельзя использовать как root-target для pruning group, иначе можно получить
+    # рассинхрон input channels после concat.
+    if name.endswith(".cv2"):
+        parent_name = ".".join(name.split(".")[:-1])
+        try:
+            parent = _get_module_by_qualname(torch_model, parent_name)
+            if hasattr(parent, "m"):
+                return True
+        except Exception:
+            pass
 
     if skip_cv1_if_parent_has_m and name.endswith(".cv1"):
         parent_name = ".".join(name.split(".")[:-1])
         try:
             parent = _get_module_by_qualname(torch_model, parent_name)
             if hasattr(parent, "m"):
-                return True
+                if include_inner_re is None or not include_inner_re.search(name):
+                    return True
         except Exception:
             pass
 
@@ -68,6 +87,7 @@ def _collect_prunable_convs(
     exclude_name_regex: Optional[str],
     skip_inner_m: bool = True,
     skip_cv1_if_parent_has_m: bool = True,
+    include_inner_m_regex: Optional[str] = None,
 ) -> List[Tuple[str, Any]]:
     exclude_re = re.compile(exclude_name_regex) if exclude_name_regex else None
     head_mod = _find_head_module(torch_model) if exclude_head else None
@@ -90,6 +110,7 @@ def _collect_prunable_convs(
             name,
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+            include_inner_m_regex=include_inner_m_regex,
         ):
             continue
         prunable.append((name, m))
@@ -231,14 +252,23 @@ def _make_example_inputs_for_tp(example_input):
     if torch.is_tensor(example_input):
         x = example_input.detach()
         x.requires_grad_(True)
-        return x
+        return (x,)
 
-    if isinstance(example_input, (list, tuple)) and len(example_input) == 1 and torch.is_tensor(example_input[0]):
-        x = example_input[0].detach()
-        x.requires_grad_(True)
-        return x
+    if isinstance(example_input, (list, tuple)):
+        prepared = []
+        for item in example_input:
+            if torch.is_tensor(item):
+                t = item.detach()
+                t.requires_grad_(True)
+                prepared.append(t)
+            else:
+                prepared.append(item)
+        return tuple(prepared)
 
-    return example_input
+    return (example_input,)
+
+
+import torch
 
 
 def _build_dependency_graph(tp, torch_model, example_input):
@@ -255,25 +285,143 @@ def _build_dependency_graph(tp, torch_model, example_input):
 
     with torch.enable_grad():
         try:
-            dg.build_dependency(torch_model, example_inputs=ex_inputs, output_transform=_out_transform)
+            dg.build_dependency(
+                torch_model,
+                example_inputs=ex_inputs,
+                output_transform=_out_transform,
+            )
         except TypeError:
             dg.build_dependency(torch_model, example_inputs=ex_inputs)
 
     return dg
 
 
+def _pick_pruning_target(tp, module):
+    import torch
+
+    conv: torch.nn.Conv2d = getattr(module, "conv")
+
+    if conv.groups == 1:
+        return conv, tp.prune_conv_out_channels
+
+    prune_depthwise_fn = getattr(tp, "prune_depthwise_conv_out_channels", None)
+    if conv.groups == conv.in_channels == conv.out_channels and prune_depthwise_fn is not None:
+        return conv, prune_depthwise_fn
+
+    return None, None
+
 def _forward_check(torch_model, example_input):
     import torch
 
-    x = example_input
-    if isinstance(x, (list, tuple)) and len(x) == 1:
-        x = x[0]
-    if torch.is_tensor(x):
-        x = x.detach()
+    if isinstance(example_input, (list, tuple)):
+        args = []
+        for item in example_input:
+            if torch.is_tensor(item):
+                args.append(item.detach())
+            else:
+                args.append(item)
+        args = tuple(args)
+    else:
+        args = (example_input.detach(),) if torch.is_tensor(example_input) else (example_input,)
 
     with torch.no_grad():
-        _ = torch_model(x)
+        _ = torch_model(*args)
 
+
+def _module_param_count(m: Any) -> int:
+    try:
+        return sum(p.numel() for p in m.parameters(recurse=False))
+    except Exception:
+        return 0
+
+
+def _conv_bn_param_count(m: Any) -> int:
+    total = 0
+    try:
+        conv = getattr(m, "conv", None)
+        bn = getattr(m, "bn", None)
+        if conv is not None:
+            total += sum(p.numel() for p in conv.parameters(recurse=False))
+        if bn is not None:
+            total += sum(p.numel() for p in bn.parameters(recurse=False))
+    except Exception:
+        pass
+    return int(total)
+
+
+def _coverage_report(
+    torch_model: Any,
+    *,
+    exclude_head: bool,
+    exclude_name_regex: Optional[str],
+    skip_inner_m: bool,
+    skip_cv1_if_parent_has_m: bool,
+    include_inner_m_regex: Optional[str],
+    protect_last_n: int,
+    topk: int = 20,
+):
+    exclude_re = re.compile(exclude_name_regex) if exclude_name_regex else None
+    include_inner_re = re.compile(include_inner_m_regex) if include_inner_m_regex else None
+    head_mod = _find_head_module(torch_model) if exclude_head else None
+
+    head_ids = set()
+    if head_mod is not None:
+        for _, hm in head_mod.named_modules():
+            head_ids.add(id(hm))
+
+    all_conv = []
+    prunable = []
+    skipped = []
+
+    for name, m in torch_model.named_modules():
+        if not _is_ultralytics_conv(m):
+            continue
+
+        size = _conv_bn_param_count(m)
+        all_conv.append((name, size))
+
+        reason = None
+        if exclude_re and exclude_re.search(name):
+            reason = "exclude_name_regex"
+        elif head_ids and id(m) in head_ids:
+            reason = "exclude_head"
+        else:
+            is_inner_m = re.search(r"\.m\.\d+\.", name) is not None
+            if skip_inner_m and is_inner_m:
+                if include_inner_re is None or not include_inner_re.search(name):
+                    reason = "skip_inner_m"
+            if reason is None and skip_cv1_if_parent_has_m and name.endswith(".cv1"):
+                parent_name = ".".join(name.split(".")[:-1])
+                try:
+                    parent = _get_module_by_qualname(torch_model, parent_name)
+                    if hasattr(parent, "m"):
+                        if include_inner_re is None or not include_inner_re.search(name):
+                            reason = "skip_cv1_if_parent_has_m"
+                except Exception:
+                    pass
+
+        if reason is None:
+            prunable.append((name, size))
+        else:
+            skipped.append((name, size, reason))
+
+    prunable_before_tail = list(prunable)
+    if protect_last_n > 0 and len(prunable) > int(protect_last_n):
+        protected_tail = prunable[-int(protect_last_n):]
+        prunable = prunable[:-int(protect_last_n)]
+        skipped.extend([(n, s, "protect_last_n") for (n, s) in protected_tail])
+
+    prunable_sorted = sorted(prunable, key=lambda x: x[1], reverse=True)
+    skipped_sorted = sorted(skipped, key=lambda x: x[1], reverse=True)
+
+    return {
+        "total_ultra_convs": len(all_conv),
+        "prunable_before_tail": len(prunable_before_tail),
+        "prunable_after_tail": len(prunable),
+        "total_prunable_params": int(sum(s for _, s in prunable)),
+        "top_prunable": prunable_sorted[:topk],
+        "top_skipped": skipped_sorted[:topk],
+    }
 
 def structured_trim_yolo(
     torch_model: Any,
@@ -290,6 +438,7 @@ def structured_trim_yolo(
     verbose: bool = True,
     skip_inner_m: bool = True,
     skip_cv1_if_parent_has_m: bool = True,
+    include_inner_m_regex: Optional[str] = None,
     importance_mode: str = "bn_gamma",
 ) -> Dict[str, int]:
     if not (0.0 < prune_ratio < 0.95):
@@ -304,19 +453,52 @@ def structured_trim_yolo(
 
     torch_model.eval()
 
+    if verbose:
+        rep = _coverage_report(
+            torch_model,
+            exclude_head=exclude_head,
+            exclude_name_regex=exclude_name_regex,
+            skip_inner_m=skip_inner_m,
+            skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+            include_inner_m_regex=include_inner_m_regex,
+            protect_last_n=protect_last_n,
+            topk=20,
+        )
+        print(
+            f"[trim] coverage: total_ultra_convs={rep['total_ultra_convs']}, "
+            f"prunable_before_tail={rep['prunable_before_tail']}, "
+            f"prunable_after_tail={rep['prunable_after_tail']}, "
+            f"prunable_params={rep['total_prunable_params']:,}"
+        )
+        if rep["top_prunable"]:
+            print("[trim] top prunable modules:")
+            for i, (n, s) in enumerate(rep["top_prunable"], 1):
+                print(f"  [{i:02d}] {n:<40} {s:,}")
+        if rep["top_skipped"]:
+            print("[trim] top skipped modules:")
+            for i, (n, s, r) in enumerate(rep["top_skipped"], 1):
+                print(f"  [{i:02d}] {n:<40} {s:,}  reason={r}")
+
     prunable = _collect_prunable_convs(
         torch_model,
         exclude_head=exclude_head,
         exclude_name_regex=exclude_name_regex,
         skip_inner_m=skip_inner_m,
         skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+        include_inner_m_regex=include_inner_m_regex,
     )
     if not prunable:
         if verbose:
             print("[trim] No prunable layers after filtering. Nothing to prune.")
-        return {"layers_pruned": 0, "channels_pruned": 0}
+        return {
+            "layers_pruned": 0,
+            "channels_pruned": 0,
+            "prunable_count": 0,
+        }
 
     if protect_last_n > 0 and len(prunable) > int(protect_last_n):
+        if verbose:
+            print(f"[trim] protect_last_n={protect_last_n}: keeping last {protect_last_n} prunable layers untouched")
         prunable = prunable[:-int(protect_last_n)]
 
     strategy = str(strategy).lower().strip()
@@ -327,16 +509,11 @@ def structured_trim_yolo(
     if strategy == "global":
         thr = _global_threshold_from_bn_gammas(prunable, prune_ratio)
 
-    prune_bn_fn = getattr(tp, "prune_batchnorm_out_channels", None)
-    if prune_bn_fn is None:
-        prune_bn_fn = getattr(tp, "prune_bn_out_channels", None)
-    if prune_bn_fn is None:
-        raise RuntimeError("torch-pruning: cannot find BN pruning fn (prune_batchnorm_out_channels/prune_bn_out_channels).")
-
     dg = _build_dependency_graph(tp, torch_model, example_input)
 
     layers_pruned = 0
     channels_pruned = 0
+    pruned_layer_names: List[str] = []
 
     for name, m in prunable:
         conv: torch.nn.Conv2d = getattr(m, "conv")
@@ -345,7 +522,10 @@ def structured_trim_yolo(
         if conv.out_channels <= min_channels:
             continue
 
-        if conv.groups not in (1, conv.in_channels, conv.out_channels):
+        root_module, prune_fn = _pick_pruning_target(tp, m)
+        if root_module is None or prune_fn is None:
+            if verbose:
+                print(f"[trim] skip {name}: unsupported grouped conv (groups={conv.groups})")
             continue
 
         if strategy == "global":
@@ -388,17 +568,28 @@ def structured_trim_yolo(
         if verbose:
             print(f"[trim] {name}: prune {len(idxs)}/{conv.out_channels} out-ch")
 
+        if hasattr(dg, "module2node") and root_module not in dg.module2node:
+            if verbose:
+                print(f"[trim] {name}: root conv is not in dependency graph, rebuilding DG")
+            dg = _build_dependency_graph(tp, torch_model, example_input)
+            if hasattr(dg, "module2node") and root_module not in dg.module2node:
+                if verbose:
+                    print(f"[trim] skip {name}: root conv still not in dependency graph")
+                continue
+
         try:
             if hasattr(dg, "get_pruning_group"):
-                group = dg.get_pruning_group(bn, prune_bn_fn, idxs=idxs)
+                group = dg.get_pruning_group(root_module, prune_fn, idxs=idxs)
                 ok = True
                 if hasattr(dg, "check_pruning_group"):
                     ok = bool(dg.check_pruning_group(group))
                 if not ok:
+                    if verbose:
+                        print(f"[trim] skip {name}: pruning group check failed")
                     continue
                 group.prune()
             else:
-                plan = dg.get_pruning_plan(bn, prune_bn_fn, idxs=idxs)
+                plan = dg.get_pruning_plan(root_module, prune_fn, idxs=idxs)
                 if plan is None:
                     continue
                 plan.exec()
@@ -407,10 +598,16 @@ def structured_trim_yolo(
 
             layers_pruned += 1
             channels_pruned += len(idxs)
+            pruned_layer_names.append(name)
 
             dg = _build_dependency_graph(tp, torch_model, example_input)
 
         except Exception as e:
             raise RuntimeError(f"Pruning failed at {name}: {e}") from e
 
-    return {"layers_pruned": layers_pruned, "channels_pruned": channels_pruned}
+    return {
+        "layers_pruned": layers_pruned,
+        "channels_pruned": channels_pruned,
+        "prunable_count": len(prunable),
+        "pruned_layer_names": pruned_layer_names,
+    }
