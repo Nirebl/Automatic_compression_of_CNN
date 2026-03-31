@@ -5,11 +5,10 @@ plugins {
 
 android {
     namespace = "com.example.testyolo"
-    compileSdk = 36 // можно 35/34, если у тебя такой SDK установлен
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.example.testyolo"
-        // РЕКОМЕНДУЮ: minSdk = 24, чтобы приложение ставилось на большее число устройств
         minSdk = 26
         targetSdk = 36
 
@@ -17,22 +16,19 @@ android {
         versionName = "1.0"
 
         ndk {
-            // Kotlin DSL: добавляем через +=
             abiFilters += listOf("arm64-v8a")
         }
+
         externalNativeBuild {
             cmake {
-                // Ставим API для CMake равным minSdk (исправит android-26 в вызове)
                 arguments += listOf("-DANDROID_PLATFORM=android-${minSdk}")
                 arguments += "-DANDROID_STL=c++_shared"
             }
         }
     }
 
-    // В AGP/KTS не используем aaptOptions внутри defaultConfig.
-    // Нужное поведение дает androidResources.noCompress:
     androidResources {
-        noCompress += listOf("param", "bin")
+        noCompress += listOf("param", "bin", "onnx")
     }
 
     buildFeatures {
@@ -59,6 +55,7 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
+
     kotlinOptions {
         jvmTarget = "11"
     }
@@ -73,7 +70,6 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 
-    // Kotlin DSL: используем val, а не def
     val camerax = "1.3.4"
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
@@ -82,4 +78,6 @@ dependencies {
     implementation("androidx.recyclerview:recyclerview:1.3.2")
     implementation("com.google.android.material:material:1.12.0")
 
+    // ONNX Runtime Android
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:latest.release")
 }
