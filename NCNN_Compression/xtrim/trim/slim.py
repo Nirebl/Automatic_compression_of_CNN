@@ -39,6 +39,105 @@ def _get_module_by_qualname(root: Any, qualname: str) -> Any:
     return cur
 
 
+def _is_xtrim_prunable_c2f_like(m: Any) -> bool:
+    return bool(getattr(m, "_xtrim_prunable_c2f_like", False))
+
+
+def _looks_like_c2f_like_parent(m: Any) -> bool:
+    return (
+        hasattr(m, "m")
+        and hasattr(m, "cv1")
+        and hasattr(m, "cv2")
+        and hasattr(m, "c")
+    )
+
+
+def _is_original_c2f_like_parent(m: Any) -> bool:
+    return _looks_like_c2f_like_parent(m) and not _is_xtrim_prunable_c2f_like(m)
+
+PSA_FAMILY_CLASSNAMES = {"Attention", "PSABlock", "PSA", "C2PSA", "C2fPSA"}
+DETECT_FAMILY_CLASSNAMES = {"Detect"}
+
+
+def _has_ancestor_class(root: Any, name: str, class_names: set[str]) -> Optional[str]:
+    parts = name.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        qn = ".".join(parts[:i])
+        try:
+            m = _get_module_by_qualname(root, qn)
+        except Exception:
+            continue
+        if m.__class__.__name__ in class_names:
+            return m.__class__.__name__
+    return None
+
+def _skip_reason(
+    torch_model: Any,
+    name: str,
+    *,
+    skip_inner_m: bool,
+    skip_cv1_if_parent_has_m: bool,
+    include_inner_m_regex: Optional[str] = None,
+) -> Optional[str]:
+    detect_cls = _has_ancestor_class(torch_model, name, DETECT_FAMILY_CLASSNAMES)
+    if detect_cls is not None:
+        return f"handled_by_detect_head_pruner:{detect_cls}"
+
+    include_inner_re = re.compile(include_inner_m_regex) if include_inner_m_regex else None
+
+    psa_cls = _has_ancestor_class(torch_model, name, PSA_FAMILY_CLASSNAMES)
+    if psa_cls is not None:
+        return f"handled_by_composite_psa_pruner:{psa_cls}"
+
+    is_inner_m = re.search(r"\.m\.\d+\.", name) is not None
+    if skip_inner_m and is_inner_m:
+        if include_inner_re is None or not include_inner_re.search(name):
+            return "skip_inner_m"
+
+    # NEW:
+    # If ANY ancestor belongs to an adapted carrier that contains PSA-family blocks,
+    # do not prune this conv with the generic channel-pruning path.
+    parts = name.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        qn = ".".join(parts[:i])
+        try:
+            anc = _get_module_by_qualname(torch_model, qn)
+        except Exception:
+            continue
+        if bool(getattr(anc, "_xtrim_contains_psa", False)):
+            if include_inner_re is None or not include_inner_re.search(name):
+                return "handled_by_composite_psa_carrier_subtree"
+
+    parent_name = ".".join(name.split(".")[:-1]) if "." in name else ""
+    parent = None
+    if parent_name:
+        try:
+            parent = _get_module_by_qualname(torch_model, parent_name)
+        except Exception:
+            parent = None
+
+    if name.endswith(".cv2"):
+        try:
+            if parent is not None and hasattr(parent, "m"):
+                return "skip_parent_cv2_aggregator"
+        except Exception:
+            pass
+
+    if name.endswith(".cv1"):
+        try:
+            if parent is not None and _is_original_c2f_like_parent(parent):
+                if include_inner_re is None or not include_inner_re.search(name):
+                    return "unsafe_original_c2f_like_cv1"
+
+            if parent is not None and skip_cv1_if_parent_has_m and hasattr(parent, "m"):
+                if include_inner_re is None or not include_inner_re.search(name):
+                    return "skip_cv1_if_parent_has_m"
+        except Exception:
+            pass
+
+    return None
+
+
 def _should_skip_prune(
     torch_model: Any,
     name: str,
@@ -47,37 +146,13 @@ def _should_skip_prune(
     skip_cv1_if_parent_has_m: bool,
     include_inner_m_regex: Optional[str] = None,
 ) -> bool:
-    include_inner_re = re.compile(include_inner_m_regex) if include_inner_m_regex else None
-
-    is_inner_m = re.search(r"\.m\.\d+\.", name) is not None
-    if skip_inner_m and is_inner_m:
-        if include_inner_re is None or not include_inner_re.search(name):
-            return True
-
-    # КРИТИЧНО:
-    # parent.cv2 у блока, у которого есть .m, — это агрегационный conv после cat(...).
-    # Его нельзя использовать как root-target для pruning group, иначе можно получить
-    # рассинхрон input channels после concat.
-    if name.endswith(".cv2"):
-        parent_name = ".".join(name.split(".")[:-1])
-        try:
-            parent = _get_module_by_qualname(torch_model, parent_name)
-            if hasattr(parent, "m"):
-                return True
-        except Exception:
-            pass
-
-    if skip_cv1_if_parent_has_m and name.endswith(".cv1"):
-        parent_name = ".".join(name.split(".")[:-1])
-        try:
-            parent = _get_module_by_qualname(torch_model, parent_name)
-            if hasattr(parent, "m"):
-                if include_inner_re is None or not include_inner_re.search(name):
-                    return True
-        except Exception:
-            pass
-
-    return False
+    return _skip_reason(
+        torch_model,
+        name,
+        skip_inner_m=skip_inner_m,
+        skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+        include_inner_m_regex=include_inner_m_regex,
+    ) is not None
 
 
 def _collect_prunable_convs(
@@ -281,7 +356,17 @@ def _build_dependency_graph(tp, torch_model, example_input):
         ts = _as_tensor_list(out)
         if not ts:
             return out
-        return max(ts, key=lambda t: t.numel())
+
+        # ВАЖНО:
+        # dependency graph должен зависеть от ВСЕХ выходных веток модели,
+        # а не только от самого большого тензора.
+        acc = None
+        for t in ts:
+            if not torch.is_floating_point(t):
+                t = t.float()
+            s = t.reshape(-1).sum()
+            acc = s if acc is None else acc + s
+        return acc
 
     with torch.enable_grad():
         try:
@@ -326,6 +411,54 @@ def _forward_check(torch_model, example_input):
 
     with torch.no_grad():
         _ = torch_model(*args)
+
+
+def _validate_c2f_like_invariants(torch_model: Any) -> None:
+    """
+    У оригинальных C2f/C3k2-like блоков инвариант жёсткий:
+        cv1.out_channels == 2 * self.c
+    Если нарушить его pruning'ом, следующий forward упадёт на split/chunk.
+
+    Для адаптированного C2fPrunable этот инвариант не обязателен,
+    поэтому проверяем только неадаптированные блоки.
+    """
+    import torch
+
+    for name, m in torch_model.named_modules():
+        if not _is_original_c2f_like_parent(m):
+            continue
+
+        conv = getattr(getattr(m, "cv1", None), "conv", None)
+        if not isinstance(conv, torch.nn.Conv2d):
+            continue
+
+        c = int(getattr(m, "c"))
+        out_ch = int(conv.out_channels)
+        expected = 2 * c
+        if out_ch != expected:
+            raise RuntimeError(
+                f"{name}: invalid C2f-like invariant: cv1.out_channels={out_ch}, expected={expected} (=2*self.c)"
+            )
+
+def _validate_psa_like_invariants(torch_model: Any) -> None:
+    import torch
+
+    for name, m in torch_model.named_modules():
+        cls = m.__class__.__name__
+        if cls not in {"PSA", "C2PSA", "C2fPSA"}:
+            continue
+
+        cv1 = getattr(getattr(m, "cv1", None), "conv", None)
+        cv2 = getattr(getattr(m, "cv2", None), "conv", None)
+        c = int(getattr(m, "c", 0))
+        if isinstance(cv1, torch.nn.Conv2d) and int(cv1.out_channels) != 2 * c:
+            raise RuntimeError(
+                f"{name}: invalid {cls} invariant: cv1.out_channels={int(cv1.out_channels)}, expected={2*c}"
+            )
+        if isinstance(cv2, torch.nn.Conv2d) and int(cv2.in_channels) != 2 * c and cls in {"PSA", "C2PSA"}:
+            raise RuntimeError(
+                f"{name}: invalid {cls} invariant: cv2.in_channels={int(cv2.in_channels)}, expected={2*c}"
+            )
 
 
 def _module_param_count(m: Any) -> int:
@@ -386,19 +519,13 @@ def _coverage_report(
         elif head_ids and id(m) in head_ids:
             reason = "exclude_head"
         else:
-            is_inner_m = re.search(r"\.m\.\d+\.", name) is not None
-            if skip_inner_m and is_inner_m:
-                if include_inner_re is None or not include_inner_re.search(name):
-                    reason = "skip_inner_m"
-            if reason is None and skip_cv1_if_parent_has_m and name.endswith(".cv1"):
-                parent_name = ".".join(name.split(".")[:-1])
-                try:
-                    parent = _get_module_by_qualname(torch_model, parent_name)
-                    if hasattr(parent, "m"):
-                        if include_inner_re is None or not include_inner_re.search(name):
-                            reason = "skip_cv1_if_parent_has_m"
-                except Exception:
-                    pass
+            reason = _skip_reason(
+                torch_model,
+                name,
+                skip_inner_m=skip_inner_m,
+                skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+                include_inner_m_regex=include_inner_m_regex,
+            )
 
         if reason is None:
             prunable.append((name, size))
@@ -440,7 +567,7 @@ def structured_trim_yolo(
     skip_cv1_if_parent_has_m: bool = True,
     include_inner_m_regex: Optional[str] = None,
     importance_mode: str = "bn_gamma",
-) -> Dict[str, int]:
+) -> dict[str, int] | dict[str, int | list[str]]:
     if not (0.0 < prune_ratio < 0.95):
         raise ValueError("prune_ratio must be in (0, 0.95)")
 
@@ -479,7 +606,10 @@ def structured_trim_yolo(
             for i, (n, s, r) in enumerate(rep["top_skipped"], 1):
                 print(f"  [{i:02d}] {n:<40} {s:,}  reason={r}")
 
-    prunable = _collect_prunable_convs(
+    # Снимок на старте нужен только для:
+    # 1) списка имён
+    # 2) глобального порога по BN-gamma
+    initial_prunable = _collect_prunable_convs(
         torch_model,
         exclude_head=exclude_head,
         exclude_name_regex=exclude_name_regex,
@@ -487,7 +617,7 @@ def structured_trim_yolo(
         skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
         include_inner_m_regex=include_inner_m_regex,
     )
-    if not prunable:
+    if not initial_prunable:
         if verbose:
             print("[trim] No prunable layers after filtering. Nothing to prune.")
         return {
@@ -496,10 +626,12 @@ def structured_trim_yolo(
             "prunable_count": 0,
         }
 
-    if protect_last_n > 0 and len(prunable) > int(protect_last_n):
+    prunable_names = [name for name, _ in initial_prunable]
+
+    if protect_last_n > 0 and len(prunable_names) > int(protect_last_n):
         if verbose:
             print(f"[trim] protect_last_n={protect_last_n}: keeping last {protect_last_n} prunable layers untouched")
-        prunable = prunable[:-int(protect_last_n)]
+        prunable_names = prunable_names[:-int(protect_last_n)]
 
     strategy = str(strategy).lower().strip()
     if strategy not in ("layerwise", "global"):
@@ -507,7 +639,7 @@ def structured_trim_yolo(
 
     thr = 0.0
     if strategy == "global":
-        thr = _global_threshold_from_bn_gammas(prunable, prune_ratio)
+        thr = _global_threshold_from_bn_gammas(initial_prunable, prune_ratio)
 
     dg = _build_dependency_graph(tp, torch_model, example_input)
 
@@ -515,7 +647,31 @@ def structured_trim_yolo(
     channels_pruned = 0
     pruned_layer_names: List[str] = []
 
-    for name, m in prunable:
+    for name in prunable_names:
+        # Всегда берём АКТУАЛЬНЫЙ модуль из текущей модели, а не старую ссылку
+        try:
+            m = _get_module_by_qualname(torch_model, name)
+        except Exception:
+            if verbose:
+                print(f"[trim] skip {name}: module no longer exists")
+            continue
+
+        if not _is_ultralytics_conv(m):
+            if verbose:
+                print(f"[trim] skip {name}: no longer an ultralytics conv")
+            continue
+
+        if _should_skip_prune(
+            torch_model,
+            name,
+            skip_inner_m=skip_inner_m,
+            skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+            include_inner_m_regex=include_inner_m_regex,
+        ):
+            if verbose:
+                print(f"[trim] skip {name}: filtered by current model state")
+            continue
+
         conv: torch.nn.Conv2d = getattr(m, "conv")
         bn: torch.nn.BatchNorm2d = getattr(m, "bn")
 
@@ -568,10 +724,92 @@ def structured_trim_yolo(
         if verbose:
             print(f"[trim] {name}: prune {len(idxs)}/{conv.out_channels} out-ch")
 
+        # Проверяем наличие root в актуальном dependency graph
         if hasattr(dg, "module2node") and root_module not in dg.module2node:
             if verbose:
                 print(f"[trim] {name}: root conv is not in dependency graph, rebuilding DG")
             dg = _build_dependency_graph(tp, torch_model, example_input)
+
+            # После rebuild нужно заново взять актуальный модуль и root
+            try:
+                m = _get_module_by_qualname(torch_model, name)
+            except Exception:
+                if verbose:
+                    print(f"[trim] skip {name}: module disappeared after rebuild")
+                continue
+
+            if not _is_ultralytics_conv(m):
+                if verbose:
+                    print(f"[trim] skip {name}: no longer an ultralytics conv after rebuild")
+                continue
+
+            if _should_skip_prune(
+                torch_model,
+                name,
+                skip_inner_m=skip_inner_m,
+                skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+                include_inner_m_regex=include_inner_m_regex,
+            ):
+                if verbose:
+                    print(f"[trim] skip {name}: filtered after rebuild")
+                continue
+
+            conv = getattr(m, "conv")
+            bn = getattr(m, "bn")
+
+            if conv.out_channels <= min_channels:
+                if verbose:
+                    print(f"[trim] skip {name}: too few channels after rebuild")
+                continue
+
+            root_module, prune_fn = _pick_pruning_target(tp, m)
+            if root_module is None or prune_fn is None:
+                if verbose:
+                    print(f"[trim] skip {name}: unsupported conv after rebuild")
+                continue
+
+            # Пересчитываем idxs на АКТУАЛЬНОМ bn/conv
+            if strategy == "global":
+                idxs = _select_prune_idxs_by_gamma(bn, thr, channel_round, min_channels)
+
+                cap = max_prune_per_layer
+                if cap is None:
+                    cap = prune_ratio
+                try:
+                    cap = float(cap)
+                except Exception:
+                    cap = float(prune_ratio)
+                cap = max(0.0, min(0.95, cap))
+
+                if cap > 0.0:
+                    max_prune = int(np.floor(cap * conv.out_channels))
+                    max_prune = max(0, min(conv.out_channels - min_channels, max_prune))
+                    if len(idxs) > max_prune:
+                        g = bn.weight.detach().abs()
+                        order = torch.argsort(g, descending=False).tolist()
+                        idxs = order[:max_prune]
+            else:
+                idxs = _select_prune_idxs_layerwise(
+                    bn,
+                    prune_ratio=float(prune_ratio),
+                    channel_round=channel_round,
+                    min_channels=min_channels,
+                    max_prune_ratio=max_prune_per_layer,
+                    importance_mode=importance_mode,
+                    conv=conv,
+                )
+
+            if not idxs:
+                if verbose:
+                    print(f"[trim] skip {name}: no prune idxs after rebuild")
+                continue
+            if len(idxs) > conv.out_channels - min_channels:
+                idxs = idxs[: max(0, conv.out_channels - min_channels)]
+            if not idxs:
+                if verbose:
+                    print(f"[trim] skip {name}: no valid prune idxs after rebuild")
+                continue
+
             if hasattr(dg, "module2node") and root_module not in dg.module2node:
                 if verbose:
                     print(f"[trim] skip {name}: root conv still not in dependency graph")
@@ -608,6 +846,6 @@ def structured_trim_yolo(
     return {
         "layers_pruned": layers_pruned,
         "channels_pruned": channels_pruned,
-        "prunable_count": len(prunable),
+        "prunable_count": len(prunable_names),
         "pruned_layer_names": pruned_layer_names,
     }

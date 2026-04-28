@@ -12,7 +12,7 @@ def main() -> int:
     ap.add_argument(
         "--history",
         type=str,
-        default="outputs/xtrim_no_lr_test/history.jsonl",
+        default="outputs/xtrim_onnx_test_10_agressive_prune_yolo_8_channel_8/history.jsonl",
         help="Path to history.jsonl",
     )
     ap.add_argument(

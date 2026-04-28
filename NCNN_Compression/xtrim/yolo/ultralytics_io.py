@@ -8,6 +8,7 @@ from typing import Any, Callable, Optional
 import torch
 from onnx import StringStringEntryProto
 
+from .detect_head_pruning import shrink_detect_heads
 from ..types import (
     CandidateConfig,
     ModelConfig,
@@ -35,7 +36,7 @@ from ..trim.gumbel_choice import (
 )
 from ..trim.dilated import apply_dilation
 from .kd_finetune import finetune_with_kd
-from .pruning_adapters import replace_c2f_with_prunable
+from .pruning_adapters import replace_c2f_with_prunable, shrink_psa_family_blocks
 from types import SimpleNamespace
 
 
@@ -203,6 +204,43 @@ def build_ultralytics_candidate(
     )
     skip_inner_m = bool(getattr(trim_cfg, "skip_inner_m", True))
     skip_cv1_if_parent_has_m = bool(getattr(trim_cfg, "skip_cv1_if_parent_has_m", True))
+    def _apply_composite_psa_pruning(stage_label: str, prune_ratio_value: float):
+        # PSA/Attention family in YOLO11 must be pruned atomically, not by individual inner convs.
+        round_to = max(int(getattr(trim_cfg, "channel_round", 8) or 8), 8)
+        min_ch = max(int(getattr(trim_cfg, "min_channels", 8) or 8), 8)
+        stats = shrink_psa_family_blocks(
+            torch_model,
+            prune_ratio=float(prune_ratio_value),
+            round_to=round_to,
+            min_channels=min_ch,
+            verbose=True,
+        )
+        all_stats[f"{stage_label}_composite_psa"] = stats
+        if stats.get("blocks_shrunk", 0):
+            print(f"[build] Composite PSA prune ({stage_label}): {stats['blocks_shrunk']} blocks shrunk")
+            all_stats[f"params_after_{stage_label}_composite_psa"] = _print_param_snapshot(
+                torch_model, f"after_{stage_label}_composite_psa", topk=20
+            )
+        return stats
+
+    def _apply_detect_head_pruning(stage_label: str, prune_ratio_value: float):
+        stats = shrink_detect_heads(
+            torch_model,
+            prune_ratio=float(prune_ratio_value),
+            round_to=max(int(getattr(trim_cfg, "channel_round", 8) or 8), 8),
+            min_channels=max(int(getattr(trim_cfg, "min_channels", 8) or 8), 8),
+            verbose=True,
+        )
+        all_stats[f"{stage_label}_detect_head"] = stats
+
+        if stats.get("heads_shrunk", 0):
+            print(f"[build] Detect head prune ({stage_label}): {stats['heads_shrunk']} heads shrunk")
+            all_stats[f"params_after_{stage_label}_detect_head"] = _print_param_snapshot(
+                torch_model, f"after_{stage_label}_detect_head", topk=20
+            )
+
+        return stats
+
 
     all_stats["trim_cfg_effective"] = {
         "exclude_head": bool(trim_cfg.exclude_head),
@@ -268,6 +306,12 @@ def build_ultralytics_candidate(
             f"({width_comp:.2f}x)"
         )
 
+        _apply_composite_psa_pruning("width", width_prune_ratio)
+
+        all_stats["params_after_width"] = _print_param_snapshot(
+            torch_model, "after_width_mult", topk=20
+        )
+
         all_stats["params_after_width"] = _print_param_snapshot(
             torch_model, "after_width_mult", topk=20
         )
@@ -315,6 +359,12 @@ def build_ultralytics_candidate(
             f"params {params_before_bn:,} -> {params_after_bn:,} "
             f"(stage {bn_comp:.2f}x, total {total_comp:.2f}x)"
         )
+
+        _apply_composite_psa_pruning("bn", float(cand.prune_ratio))
+        _apply_detect_head_pruning("bn", float(cand.prune_ratio))
+
+        with torch.no_grad():
+            _ = torch_model(x)
 
         with torch.no_grad():
             _ = torch_model(x)

@@ -1,13 +1,13 @@
 model:
-  weights: yolov8m.pt
+  weights: yolo2612m.pt
   data: coco128.yaml
   imgsz: 640
   device: 0
   task: detect
 
 trim:
-  channel_round: 2
-  min_channels: 2
+  channel_round: 8
+  min_channels: 8
   exclude_head: false
   exclude_name_regex: null
   strategy: global
@@ -45,7 +45,7 @@ tools:
   ncnn2int8: "C:/Projects/ITMO/Diploma/NCNN_Compression/ncnn-20260113-windows-vs2022/ncnn-20260113-windows-vs2022/x64/bin/ncnn2int8.exe"
 
 train:
-  short_epochs: 100
+  short_epochs: 50
   lr: 0.0002
   kd_enabled: true
 
@@ -128,7 +128,7 @@ operator_choice:
 
 search_space:
   width_mult: [ 1 ]
-  prune_ratio: [ 0.8]
+  prune_ratio: [ 0.8 ]
   lowrank_rank: [ 0 ]
   sparse_1x1: [ 0 ]
 
@@ -159,7 +159,7 @@ onnx_ptq:
 
 qat:
   enabled: true
-  acc_drop_threshold: 0.03
+  acc_drop_threshold: 0.01
   epochs: 50
   lr: 0.00005
   max_train_batches: 0

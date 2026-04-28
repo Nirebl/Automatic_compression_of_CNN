@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, cast
 
@@ -162,42 +161,48 @@ def _build_train_loader_ultralytics(data_yaml: str, imgsz: int, batch: int, work
     return loader
 
 
-def _build_detection_loss(student_model: nn.Module):
-    try:
-        from ultralytics.utils.loss import v8DetectionLoss
-    except Exception as e:
-        raise RuntimeError(f"Cannot import ultralytics.utils.loss.v8DetectionLoss: {e}")
+def _normalize_loss_hyp(obj: Any) -> None:
+    if obj is None:
+        return
 
-    try:
-        from ultralytics.cfg import get_cfg
-    except Exception:
-        get_cfg = None
+    hyp = getattr(obj, "hyp", None)
+    if hyp is None:
+        return
 
-    args = getattr(student_model, "args", None)
-
-    if isinstance(args, dict):
-        if get_cfg is not None:
-            student_model.args = get_cfg(overrides=args)
-        else:
+    if isinstance(hyp, dict):
+        try:
+            from ultralytics.cfg import get_cfg
+            obj.hyp = get_cfg(overrides=hyp)
+        except Exception:
             from types import SimpleNamespace
-            student_model.args = SimpleNamespace(**args)
-    else:
-        need = ("box", "cls", "dfl")
-        if (args is None) or (not all(hasattr(args, k) for k in need)):
-            if get_cfg is not None:
-                cfg = get_cfg()
-                if hasattr(args, "__dict__"):
-                    for k, v in args.__dict__.items():
-                        setattr(cfg, k, v)
-                student_model.args = cfg
-            else:
-                from types import SimpleNamespace
-                base = {"box": 7.5, "cls": 0.5, "dfl": 1.5}
-                if hasattr(args, "__dict__"):
-                    base.update(args.__dict__)
-                student_model.args = SimpleNamespace(**base)
+            obj.hyp = SimpleNamespace(**hyp)
 
-    return v8DetectionLoss(student_model)
+
+def _init_model_criterion(student_model: nn.Module):
+    """
+    Let the model choose the correct criterion for its current head type
+    (plain detect vs end-to-end / one2one / one2many).
+    Then normalize hyp objects so inner losses can safely access hyp.box/hyp.cls/hyp.dfl.
+    """
+    if hasattr(student_model, "criterion"):
+        try:
+            delattr(student_model, "criterion")
+        except Exception:
+            try:
+                student_model.criterion = None
+            except Exception:
+                pass
+
+    if not hasattr(student_model, "init_criterion"):
+        raise RuntimeError("student_torch_model has no init_criterion() method")
+
+    criterion = student_model.init_criterion()
+    _normalize_loss_hyp(criterion)
+    _normalize_loss_hyp(getattr(criterion, "one2many", None))
+    _normalize_loss_hyp(getattr(criterion, "one2one", None))
+
+    student_model.criterion = criterion
+    return criterion
 
 
 def _scalarize(x: Any, device: torch.device) -> torch.Tensor:
@@ -318,7 +323,8 @@ def finetune_with_kd(
         workers=int(kd_cfg.workers),
         model_stride=stride,
     )
-    criterion = _build_detection_loss(student_torch_model)
+
+    _ = _init_model_criterion(student_torch_model)
 
     lr = float(override_lr) if override_lr is not None else float(train_cfg.lr)
     opt = torch.optim.AdamW(student_torch_model.parameters(), lr=lr)
@@ -338,7 +344,8 @@ def finetune_with_kd(
             _lut_obj = LatencyLUT(lut_cfg.lut_path, verbose=True)
             _input_shape = (1, 3, int(model_cfg.imgsz), int(model_cfg.imgsz))
             lut_result = estimate_model_latency(
-                student_torch_model, _lut_obj,
+                student_torch_model,
+                _lut_obj,
                 input_shape=_input_shape,
                 macs_per_ms=float(lut_cfg.macs_per_ms),
                 verbose=False,
@@ -367,13 +374,18 @@ def finetune_with_kd(
     for ep in range(epochs):
         if gumbel_cfg is not None and gumbel_cfg.enabled:
             from ..trim.gumbel_choice import set_gumbel_temperature, tau_linear, tau_exponential
+
             if str(gumbel_cfg.tau_schedule) == "linear":
                 tau = tau_linear(ep, epochs, float(gumbel_cfg.tau_start), float(gumbel_cfg.tau_end))
             else:
                 tau = tau_exponential(ep, epochs, float(gumbel_cfg.tau_start), float(gumbel_cfg.tau_end))
+
             n_updated = set_gumbel_temperature(student_torch_model, tau)
             if n_updated > 0 and ep == 0:
-                print(f"[kd][gumbel] tau schedule: {gumbel_cfg.tau_start} -> {gumbel_cfg.tau_end} ({gumbel_cfg.tau_schedule}), {n_updated} layers")
+                print(
+                    f"[kd][gumbel] tau schedule: {gumbel_cfg.tau_start} -> {gumbel_cfg.tau_end} "
+                    f"({gumbel_cfg.tau_schedule}), {n_updated} layers"
+                )
             if n_updated > 0:
                 print(f"[kd][gumbel] ep={ep+1}/{epochs} tau={tau:.4f}")
 
@@ -399,7 +411,7 @@ def finetune_with_kd(
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
                 preds_s = student_torch_model(img)
 
-                loss_det_raw, _ = criterion(preds_s, batch)
+                loss_det_raw, _ = student_torch_model.loss(batch, preds_s)
                 loss_det = _scalarize(loss_det_raw, device)
 
                 loss_feat = torch.zeros((), device=device)
@@ -426,7 +438,12 @@ def finetune_with_kd(
                 )
                 loss_bn = _scalarize(loss_bn, device)
 
-                loss = loss_det + float(kd_cfg.lambda_feat) * loss_feat + float(kd_cfg.lambda_head) * loss_head + loss_bn
+                loss = (
+                    loss_det
+                    + float(kd_cfg.lambda_feat) * loss_feat
+                    + float(kd_cfg.lambda_head) * loss_head
+                    + loss_bn
+                )
                 if _lat_penalty_value > 0.0:
                     loss = loss + _lat_penalty_value
                 loss = _scalarize(loss, device)
@@ -444,11 +461,11 @@ def finetune_with_kd(
 
             if (bi + 1) % 10 == 0:
                 tag = "qat" if enable_fake_quant else "kd"
-                lat_str = f" lat_pen={sum_lat/steps:.4f}" if _lat_penalty_value > 0.0 else ""
+                lat_str = f" lat_pen={sum_lat / steps:.4f}" if _lat_penalty_value > 0.0 else ""
                 print(
                     f"[{tag}][ep {ep+1}/{epochs}][{bi+1}] "
-                    f"det={sum_det/steps:.4f} feat={sum_feat/steps:.4f} "
-                    f"head={sum_head/steps:.4f} bn={sum_bn/steps:.6f}{lat_str}"
+                    f"det={sum_det / steps:.4f} feat={sum_feat / steps:.4f} "
+                    f"head={sum_head / steps:.4f} bn={sum_bn / steps:.6f}{lat_str}"
                 )
 
             if _lut_obj is not None and (bi + 1) % _log_every == 0:
