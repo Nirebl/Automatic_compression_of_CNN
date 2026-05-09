@@ -179,6 +179,10 @@ def build_ultralytics_candidate(
     yolo = YOLO(model_cfg.weights)
     torch_model = yolo.model
 
+    legacy_yolov8_pruning = bool(getattr(trim_cfg, "legacy_yolov8_pruning", False))
+    # Восстановительный YOLOv8m-режим тоже должен использовать C2fPrunable.
+    # Без этой адаптации generic torch-pruning может ломать оригинальные C2f split/chunk
+    # и внутренние Bottleneck-блоки, что как раз давало падение на model.2.m.0.cv2.
     adapt_c2f_for_pruning = bool(getattr(trim_cfg, "adapt_c2f_for_pruning", False))
     will_prune = (
             float(getattr(cand, "width_mult", 1.0)) < 1.0
@@ -205,6 +209,12 @@ def build_ultralytics_candidate(
     skip_inner_m = bool(getattr(trim_cfg, "skip_inner_m", True))
     skip_cv1_if_parent_has_m = bool(getattr(trim_cfg, "skip_cv1_if_parent_has_m", True))
     def _apply_composite_psa_pruning(stage_label: str, prune_ratio_value: float):
+        if legacy_yolov8_pruning:
+            stats = {"blocks_shrunk": 0, "channels_pruned": 0, "skipped": "legacy_yolov8_pruning=true"}
+            all_stats[f"{stage_label}_composite_psa"] = stats
+            print(f"[build] Composite PSA prune ({stage_label}): skipped because legacy_yolov8_pruning=true")
+            return stats
+
         # PSA/Attention family in YOLO11 must be pruned atomically, not by individual inner convs.
         round_to = max(int(getattr(trim_cfg, "channel_round", 8) or 8), 8)
         min_ch = max(int(getattr(trim_cfg, "min_channels", 8) or 8), 8)
@@ -224,6 +234,26 @@ def build_ultralytics_candidate(
         return stats
 
     def _apply_detect_head_pruning(stage_label: str, prune_ratio_value: float):
+        if legacy_yolov8_pruning:
+            stats = {"heads_shrunk": 0, "channels_pruned": 0, "skipped": "legacy_yolov8_pruning=true"}
+            all_stats[f"{stage_label}_detect_head"] = stats
+            print(f"[build] Detect head prune ({stage_label}): skipped because legacy_yolov8_pruning=true")
+            return stats
+
+        # Важно: Detect-head должен подчиняться trim.exclude_head.
+        # Раньше structured_trim_yolo(...) голову пропускал, но этот дополнительный
+        # shrink_detect_heads(...) всё равно резал её после основного pruning. Из-за этого
+        # результаты для p=0.60/p=0.80 сильно проседали относительно старых запусков.
+        if bool(getattr(trim_cfg, "exclude_head", True)):
+            stats = {
+                "heads_shrunk": 0,
+                "channels_pruned": 0,
+                "skipped": "trim.exclude_head=true",
+            }
+            all_stats[f"{stage_label}_detect_head"] = stats
+            print(f"[build] Detect head prune ({stage_label}): skipped because trim.exclude_head=true")
+            return stats
+
         stats = shrink_detect_heads(
             torch_model,
             prune_ratio=float(prune_ratio_value),
@@ -252,6 +282,7 @@ def build_ultralytics_candidate(
         "skip_cv1_if_parent_has_m": skip_cv1_if_parent_has_m,
         "include_inner_m_regex": include_inner_m_regex,
         "adapt_c2f_for_pruning": adapt_c2f_for_pruning,
+        "legacy_yolov8_pruning": legacy_yolov8_pruning,
     }
 
     all_stats["params_initial"] = _print_param_snapshot(torch_model, "initial", topk=20)
@@ -282,6 +313,7 @@ def build_ultralytics_candidate(
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
             include_inner_m_regex=include_inner_m_regex,
+            legacy_yolov8_pruning=legacy_yolov8_pruning,
         )
 
         params_after_width = _count_params(torch_model)
@@ -312,10 +344,6 @@ def build_ultralytics_candidate(
             torch_model, "after_width_mult", topk=20
         )
 
-        all_stats["params_after_width"] = _print_param_snapshot(
-            torch_model, "after_width_mult", topk=20
-        )
-
     if cand.prune_ratio > 0.0:
         print(f"[build] Applying prune_ratio={cand.prune_ratio} (BN-gamma importance)")
         strategy = str(getattr(trim_cfg, "strategy", "layerwise"))
@@ -340,6 +368,7 @@ def build_ultralytics_candidate(
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
             include_inner_m_regex=include_inner_m_regex,
+            legacy_yolov8_pruning=legacy_yolov8_pruning,
         )
 
         params_after_bn = _count_params(torch_model)
