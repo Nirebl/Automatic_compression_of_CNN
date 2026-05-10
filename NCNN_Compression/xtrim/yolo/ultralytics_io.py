@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -179,10 +180,6 @@ def build_ultralytics_candidate(
     yolo = YOLO(model_cfg.weights)
     torch_model = yolo.model
 
-    legacy_yolov8_pruning = bool(getattr(trim_cfg, "legacy_yolov8_pruning", False))
-    # Восстановительный YOLOv8m-режим тоже должен использовать C2fPrunable.
-    # Без этой адаптации generic torch-pruning может ломать оригинальные C2f split/chunk
-    # и внутренние Bottleneck-блоки, что как раз давало падение на model.2.m.0.cv2.
     adapt_c2f_for_pruning = bool(getattr(trim_cfg, "adapt_c2f_for_pruning", False))
     will_prune = (
             float(getattr(cand, "width_mult", 1.0)) < 1.0
@@ -209,12 +206,6 @@ def build_ultralytics_candidate(
     skip_inner_m = bool(getattr(trim_cfg, "skip_inner_m", True))
     skip_cv1_if_parent_has_m = bool(getattr(trim_cfg, "skip_cv1_if_parent_has_m", True))
     def _apply_composite_psa_pruning(stage_label: str, prune_ratio_value: float):
-        if legacy_yolov8_pruning:
-            stats = {"blocks_shrunk": 0, "channels_pruned": 0, "skipped": "legacy_yolov8_pruning=true"}
-            all_stats[f"{stage_label}_composite_psa"] = stats
-            print(f"[build] Composite PSA prune ({stage_label}): skipped because legacy_yolov8_pruning=true")
-            return stats
-
         # PSA/Attention family in YOLO11 must be pruned atomically, not by individual inner convs.
         round_to = max(int(getattr(trim_cfg, "channel_round", 8) or 8), 8)
         min_ch = max(int(getattr(trim_cfg, "min_channels", 8) or 8), 8)
@@ -234,12 +225,6 @@ def build_ultralytics_candidate(
         return stats
 
     def _apply_detect_head_pruning(stage_label: str, prune_ratio_value: float):
-        if legacy_yolov8_pruning:
-            stats = {"heads_shrunk": 0, "channels_pruned": 0, "skipped": "legacy_yolov8_pruning=true"}
-            all_stats[f"{stage_label}_detect_head"] = stats
-            print(f"[build] Detect head prune ({stage_label}): skipped because legacy_yolov8_pruning=true")
-            return stats
-
         # Важно: Detect-head должен подчиняться trim.exclude_head.
         # Раньше structured_trim_yolo(...) голову пропускал, но этот дополнительный
         # shrink_detect_heads(...) всё равно резал её после основного pruning. Из-за этого
@@ -282,7 +267,6 @@ def build_ultralytics_candidate(
         "skip_cv1_if_parent_has_m": skip_cv1_if_parent_has_m,
         "include_inner_m_regex": include_inner_m_regex,
         "adapt_c2f_for_pruning": adapt_c2f_for_pruning,
-        "legacy_yolov8_pruning": legacy_yolov8_pruning,
     }
 
     all_stats["params_initial"] = _print_param_snapshot(torch_model, "initial", topk=20)
@@ -313,7 +297,6 @@ def build_ultralytics_candidate(
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
             include_inner_m_regex=include_inner_m_regex,
-            legacy_yolov8_pruning=legacy_yolov8_pruning,
         )
 
         params_after_width = _count_params(torch_model)
@@ -368,7 +351,6 @@ def build_ultralytics_candidate(
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
             include_inner_m_regex=include_inner_m_regex,
-            legacy_yolov8_pruning=legacy_yolov8_pruning,
         )
 
         params_after_bn = _count_params(torch_model)
@@ -740,8 +722,35 @@ def _extract_map5095(res: Any) -> float:
     return 0.0
 
 
+def _make_eval_yolo_copy(student: UltralyticsStudent, model_cfg: ModelConfig):
+    """
+    Build a throwaway YOLO wrapper around a deepcopy of the student model.
+
+    Ultralytics validation routes PyTorch models through AutoBackend with fuse=True.
+    For end-to-end heads (YOLO26), model.fuse() removes the auxiliary one2many
+    branch needed for further training/QAT. Validation therefore must never run on
+    the live student object when the same model may be trained again later.
+    """
+    from ultralytics import YOLO
+
+    eval_yolo = YOLO(model_cfg.weights)
+    eval_model = deepcopy(student.torch_model)
+    eval_yolo.model = eval_model
+    if hasattr(eval_yolo, "_model"):
+        eval_yolo._model = eval_model
+    try:
+        eval_yolo.predictor = None
+    except Exception:
+        pass
+    return eval_yolo
+
+
 def eval_ultralytics_map(student: UltralyticsStudent, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> float:
-    res = student.yolo.val(**_val_kwargs(model_cfg, eval_cfg))
+    # Important for YOLO26: val() may fuse a PyTorch model in-place, which removes
+    # one2many from an end-to-end Detect head. Evaluate a deepcopy and keep the
+    # original student trainable for possible QAT recovery.
+    eval_yolo = _make_eval_yolo_copy(student, model_cfg)
+    res = eval_yolo.val(**_val_kwargs(model_cfg, eval_cfg))
     return _extract_map5095(res)
 
 

@@ -166,11 +166,6 @@ class TrimConfig:
     include_inner_m_regex: Optional[str] = None
     adapt_c2f_for_pruning: bool = False
 
-    # Compatibility switch for reproducing the older YOLOv8m April pruning runs.
-    # When enabled, generic torch-pruning is allowed to see Detect/PSA/C2f-like
-    # branches and the newer YOLO11-specific composite pruners are not applied.
-    legacy_yolov8_pruning: bool = False
-
 
 @dataclass(frozen=True)
 class LatencyConfig:

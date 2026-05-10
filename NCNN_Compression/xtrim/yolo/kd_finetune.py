@@ -84,6 +84,22 @@ def _find_detect_module(model: nn.Module) -> nn.Module | None:
     return None
 
 
+def _assert_end2end_training_head_is_intact(model: nn.Module) -> None:
+    """Raise a clear error if an end-to-end Detect head was already fused for inference."""
+    head = _find_detect_module(model)
+    if head is None or not bool(getattr(head, "end2end", False)):
+        return
+
+    cv2 = getattr(head, "cv2", None)
+    cv3 = getattr(head, "cv3", None)
+    if cv2 is None or cv3 is None:
+        raise RuntimeError(
+            "End-to-end Detect head is fused: one2many cv2/cv3 is missing. "
+            "For YOLO26, run validation/export on a deepcopy of the model, not on the live student, "
+            "before KD/QAT training."
+        )
+
+
 class _HookMgr:
     def __init__(self, modules_feat: List[nn.Module], module_head: nn.Module | None):
         self.modules_feat = modules_feat
@@ -276,6 +292,7 @@ def finetune_with_kd(
     student_torch_model.train()
     teacher_torch_model.eval()
 
+    _assert_end2end_training_head_is_intact(student_torch_model)
     _deinference_model(student_torch_model)
 
     for p in student_torch_model.parameters():

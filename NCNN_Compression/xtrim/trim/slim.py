@@ -78,42 +78,35 @@ def _skip_reason(
     skip_inner_m: bool,
     skip_cv1_if_parent_has_m: bool,
     include_inner_m_regex: Optional[str] = None,
-    legacy_yolov8_pruning: bool = False,
 ) -> Optional[str]:
-    # In the newer YOLO11/YOLO26 path Detect/PSA blocks are handled by
-    # specialized pruners.  For reproducing the older YOLOv8m April results,
-    # legacy_yolov8_pruning=True restores the old behavior: those modules stay
-    # visible to generic torch-pruning instead of being filtered out here.
-    if not legacy_yolov8_pruning:
-        detect_cls = _has_ancestor_class(torch_model, name, DETECT_FAMILY_CLASSNAMES)
-        if detect_cls is not None:
-            return f"handled_by_detect_head_pruner:{detect_cls}"
+    detect_cls = _has_ancestor_class(torch_model, name, DETECT_FAMILY_CLASSNAMES)
+    if detect_cls is not None:
+        return f"handled_by_detect_head_pruner:{detect_cls}"
 
     include_inner_re = re.compile(include_inner_m_regex) if include_inner_m_regex else None
 
-    if not legacy_yolov8_pruning:
-        psa_cls = _has_ancestor_class(torch_model, name, PSA_FAMILY_CLASSNAMES)
-        if psa_cls is not None:
-            return f"handled_by_composite_psa_pruner:{psa_cls}"
+    psa_cls = _has_ancestor_class(torch_model, name, PSA_FAMILY_CLASSNAMES)
+    if psa_cls is not None:
+        return f"handled_by_composite_psa_pruner:{psa_cls}"
 
     is_inner_m = re.search(r"\.m\.\d+\.", name) is not None
     if skip_inner_m and is_inner_m:
         if include_inner_re is None or not include_inner_re.search(name):
             return "skip_inner_m"
 
+    # NEW:
     # If ANY ancestor belongs to an adapted carrier that contains PSA-family blocks,
-    # do not prune this conv with the generic channel-pruning path in the newer path.
-    if not legacy_yolov8_pruning:
-        parts = name.split(".")
-        for i in range(len(parts) - 1, 0, -1):
-            qn = ".".join(parts[:i])
-            try:
-                anc = _get_module_by_qualname(torch_model, qn)
-            except Exception:
-                continue
-            if bool(getattr(anc, "_xtrim_contains_psa", False)):
-                if include_inner_re is None or not include_inner_re.search(name):
-                    return "handled_by_composite_psa_carrier_subtree"
+    # do not prune this conv with the generic channel-pruning path.
+    parts = name.split(".")
+    for i in range(len(parts) - 1, 0, -1):
+        qn = ".".join(parts[:i])
+        try:
+            anc = _get_module_by_qualname(torch_model, qn)
+        except Exception:
+            continue
+        if bool(getattr(anc, "_xtrim_contains_psa", False)):
+            if include_inner_re is None or not include_inner_re.search(name):
+                return "handled_by_composite_psa_carrier_subtree"
 
     parent_name = ".".join(name.split(".")[:-1]) if "." in name else ""
     parent = None
@@ -126,32 +119,17 @@ def _skip_reason(
     if name.endswith(".cv2"):
         try:
             if parent is not None and hasattr(parent, "m"):
-                # C2f/C3k2/C2fPrunable aggregator convs receive concatenated branches.
-                # Pruning them directly through the generic TP path is unstable on YOLOv8 neck
-                # blocks (for example model.15.cv2 can fail inside torch-pruning with
-                # "list index out of range"). The safe compression path is to prune the
-                # branch convs (cv0/cv1) and let dependency propagation adjust this cv2 input.
-                # Keep this skip even in legacy_yolov8_pruning mode.
                 return "skip_parent_cv2_aggregator"
         except Exception:
             pass
 
     if name.endswith(".cv1"):
         try:
-            # Оригинальный Ultralytics C2f/C3k2 делает split/chunk после cv1.
-            # Его cv1 нельзя резать generic torch-pruning даже в legacy-режиме:
-            # self.c не меняется, и модель легко ломается на несовпадении каналов.
-            # Если блок уже заменён на C2fPrunable, cv1 — отдельная ветка, её резать можно.
             if parent is not None and _is_original_c2f_like_parent(parent):
                 if include_inner_re is None or not include_inner_re.search(name):
                     return "unsafe_original_c2f_like_cv1"
 
-            if (
-                parent is not None
-                and skip_cv1_if_parent_has_m
-                and hasattr(parent, "m")
-                and not _is_xtrim_prunable_c2f_like(parent)
-            ):
+            if parent is not None and skip_cv1_if_parent_has_m and hasattr(parent, "m"):
                 if include_inner_re is None or not include_inner_re.search(name):
                     return "skip_cv1_if_parent_has_m"
         except Exception:
@@ -167,7 +145,6 @@ def _should_skip_prune(
     skip_inner_m: bool,
     skip_cv1_if_parent_has_m: bool,
     include_inner_m_regex: Optional[str] = None,
-    legacy_yolov8_pruning: bool = False,
 ) -> bool:
     return _skip_reason(
         torch_model,
@@ -175,7 +152,6 @@ def _should_skip_prune(
         skip_inner_m=skip_inner_m,
         skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
         include_inner_m_regex=include_inner_m_regex,
-        legacy_yolov8_pruning=legacy_yolov8_pruning,
     ) is not None
 
 
@@ -187,7 +163,6 @@ def _collect_prunable_convs(
     skip_inner_m: bool = True,
     skip_cv1_if_parent_has_m: bool = True,
     include_inner_m_regex: Optional[str] = None,
-    legacy_yolov8_pruning: bool = False,
 ) -> List[Tuple[str, Any]]:
     exclude_re = re.compile(exclude_name_regex) if exclude_name_regex else None
     head_mod = _find_head_module(torch_model) if exclude_head else None
@@ -211,7 +186,6 @@ def _collect_prunable_convs(
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
             include_inner_m_regex=include_inner_m_regex,
-            legacy_yolov8_pruning=legacy_yolov8_pruning,
         ):
             continue
         prunable.append((name, m))
@@ -516,10 +490,9 @@ def _coverage_report(
     skip_inner_m: bool,
     skip_cv1_if_parent_has_m: bool,
     include_inner_m_regex: Optional[str],
-    legacy_yolov8_pruning: bool = False,
-    protect_last_n: int = 0,
+    protect_last_n: int,
     topk: int = 20,
-) -> dict[str, Any]:
+):
     exclude_re = re.compile(exclude_name_regex) if exclude_name_regex else None
     include_inner_re = re.compile(include_inner_m_regex) if include_inner_m_regex else None
     head_mod = _find_head_module(torch_model) if exclude_head else None
@@ -552,7 +525,6 @@ def _coverage_report(
                 skip_inner_m=skip_inner_m,
                 skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
                 include_inner_m_regex=include_inner_m_regex,
-                legacy_yolov8_pruning=legacy_yolov8_pruning,
             )
 
         if reason is None:
@@ -595,7 +567,6 @@ def structured_trim_yolo(
     skip_cv1_if_parent_has_m: bool = True,
     include_inner_m_regex: Optional[str] = None,
     importance_mode: str = "bn_gamma",
-    legacy_yolov8_pruning: bool = False,
 ) -> dict[str, int] | dict[str, int | list[str]]:
     if not (0.0 < prune_ratio < 0.95):
         raise ValueError("prune_ratio must be in (0, 0.95)")
@@ -617,7 +588,6 @@ def structured_trim_yolo(
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
             include_inner_m_regex=include_inner_m_regex,
-            legacy_yolov8_pruning=legacy_yolov8_pruning,
             protect_last_n=protect_last_n,
             topk=20,
         )
@@ -646,7 +616,6 @@ def structured_trim_yolo(
         skip_inner_m=skip_inner_m,
         skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
         include_inner_m_regex=include_inner_m_regex,
-        legacy_yolov8_pruning=legacy_yolov8_pruning,
     )
     if not initial_prunable:
         if verbose:
@@ -698,7 +667,6 @@ def structured_trim_yolo(
             skip_inner_m=skip_inner_m,
             skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
             include_inner_m_regex=include_inner_m_regex,
-            legacy_yolov8_pruning=legacy_yolov8_pruning,
         ):
             if verbose:
                 print(f"[trim] skip {name}: filtered by current model state")
@@ -781,7 +749,6 @@ def structured_trim_yolo(
                 skip_inner_m=skip_inner_m,
                 skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
                 include_inner_m_regex=include_inner_m_regex,
-                legacy_yolov8_pruning=legacy_yolov8_pruning,
             ):
                 if verbose:
                     print(f"[trim] skip {name}: filtered after rebuild")
