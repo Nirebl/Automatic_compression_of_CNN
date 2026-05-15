@@ -27,6 +27,8 @@ from .types import (
     QATConfig,
     AndroidDemoConfig,
     SearchConfig,
+    TrimConfig,
+    StagedPruningConfig,
     OrtAndroidBenchConfig,
 )
 from .android_app_bench import AndroidAppBench, AndroidAppBenchConfig
@@ -50,7 +52,11 @@ class XTrimOrchestrator:
         android_demo_cfg: AndroidDemoConfig,
         search_cfg: SearchConfig,
         search_space: Dict[str, List[Any]],
+        trim_cfg: Optional[TrimConfig] = None,
+        staged_pruning_cfg: Optional[StagedPruningConfig] = None,
         build_candidate_fn: Callable[[CandidateConfig], Any],
+        apply_pruning_stage_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+        extract_pruning_architecture_fn: Optional[Callable[[Any], Dict[str, Any]]] = None,
         warmstart_fn: Callable[[Any], None],
         finetune_fn: Callable[[Any, TrainConfig], Any],
         finetune_qat_fn: Optional[Callable[[Any, TrainConfig], Any]] = None,
@@ -74,8 +80,12 @@ class XTrimOrchestrator:
         self.android_demo_cfg = android_demo_cfg
         self.search_cfg = search_cfg
         self.search_space = search_space
+        self.trim_cfg = trim_cfg or TrimConfig()
+        self.staged_pruning_cfg = staged_pruning_cfg or StagedPruningConfig()
 
         self.build_candidate_fn = build_candidate_fn
+        self.apply_pruning_stage_fn = apply_pruning_stage_fn
+        self.extract_pruning_architecture_fn = extract_pruning_architecture_fn
         self.warmstart_fn = warmstart_fn
         self.finetune_fn = finetune_fn
         self.finetune_qat_fn = finetune_qat_fn
@@ -520,12 +530,66 @@ class XTrimOrchestrator:
                 extra[f"acc_onnx_int8_{tag}_skipped"] = str(e)
         return p
 
+    def _prune_mode(self) -> str:
+        mode = str(getattr(self.trim_cfg, "prune_mode", "one_shot") or "one_shot").strip().lower()
+        if mode not in {"one_shot", "staged"}:
+            raise ValueError(f"Unsupported trim.prune_mode={mode!r}; expected 'one_shot' or 'staged'")
+        return mode
 
-    def _process_candidate(self, cand: CandidateConfig, run_dir: Path) -> HistoryItem:
-        student = self.build_candidate_fn(cand)
-        self.warmstart_fn(student)
+    @staticmethod
+    def _local_prune_ratio(prev_total: float, target_total: float) -> float:
+        """Convert cumulative pruning targets into a local ratio for the current model."""
+        prev = float(prev_total)
+        target = float(target_total)
+        if not (0.0 <= prev < 1.0):
+            raise ValueError(f"prev_total must be in [0, 1), got {prev_total}")
+        if not (prev < target < 1.0):
+            raise ValueError(f"target_total must be in ({prev}, 1), got {target_total}")
+        return float(1.0 - ((1.0 - target) / (1.0 - prev)))
 
-        extra: Dict[str, Any] = {}
+    def _build_pruning_plan(self, final_target: float) -> List[Dict[str, float]]:
+        target = float(final_target)
+        if target <= 0.0:
+            return []
+        if target >= 1.0:
+            raise ValueError(f"candidate prune_ratio must be < 1.0, got {target}")
+
+        if self._prune_mode() == "one_shot":
+            targets = [target]
+        else:
+            raw = [float(v) for v in getattr(self.staged_pruning_cfg, "milestones", ())]
+            if any(not (0.0 < v < 1.0) for v in raw):
+                raise ValueError(f"staged_pruning.milestones must be in (0, 1), got {raw}")
+            targets = sorted({v for v in raw if v < target})
+            targets.append(target)
+
+        plan: List[Dict[str, float]] = []
+        prev = 0.0
+        for stage_idx, stage_target in enumerate(targets, 1):
+            local = self._local_prune_ratio(prev, stage_target)
+            plan.append(
+                {
+                    "stage_index": int(stage_idx),
+                    "previous_total": float(prev),
+                    "target_total": float(stage_target),
+                    "local_ratio": float(local),
+                }
+            )
+            prev = stage_target
+        return plan
+
+    def _stage_train_cfg(self, *, is_final: bool) -> TrainConfig:
+        cfg = self.staged_pruning_cfg
+        if is_final:
+            epochs = self.train_cfg.short_epochs if cfg.final_epochs is None else int(cfg.final_epochs)
+            lr = self.train_cfg.lr if cfg.final_lr is None else float(cfg.final_lr)
+        else:
+            epochs = int(cfg.intermediate_epochs)
+            lr = self.train_cfg.lr if cfg.intermediate_lr is None else float(cfg.intermediate_lr)
+        return dataclasses.replace(self.train_cfg, short_epochs=int(epochs), lr=float(lr))
+
+    @staticmethod
+    def _collect_student_transform_stats(student: Any, extra: Dict[str, Any]) -> None:
         try:
             if hasattr(student, "yolo") and hasattr(student.yolo, "_xtrim_trim_stats"):
                 extra["trim_stats"] = getattr(student.yolo, "_xtrim_trim_stats")
@@ -533,13 +597,245 @@ class XTrimOrchestrator:
                 extra["all_transform_stats"] = getattr(student.yolo, "_xtrim_all_stats")
         except Exception as e:
             print(e)
-            pass
 
-        finetune_logs = self.finetune_fn(student, self.train_cfg)
-        if isinstance(finetune_logs, dict):
-            extra["finetune_logs"] = finetune_logs
+    def _staged_target_mode(self) -> str:
+        mode = str(getattr(self.staged_pruning_cfg, "target_mode", "ratio_schedule") or "ratio_schedule").strip().lower()
+        if mode not in {"ratio_schedule", "match_one_shot_architecture"}:
+            raise ValueError(
+                f"Unsupported staged_pruning.target_mode={mode!r}; expected "
+                "'ratio_schedule' or 'match_one_shot_architecture'"
+            )
+        return mode
 
-        acc = float(self.eval_acc_fn(student))
+    @staticmethod
+    def _interpolate_width_map(
+        current: Dict[str, Any],
+        final: Dict[str, Any],
+        progress: float,
+    ) -> Dict[str, int]:
+        """Move current widths toward final widths without undershooting the final target."""
+        p = max(0.0, min(1.0, float(progress)))
+        out: Dict[str, int] = {}
+        for name, final_width in dict(final or {}).items():
+            cur = int(dict(current or {}).get(name, final_width))
+            fin = int(final_width)
+            if cur <= fin:
+                out[str(name)] = cur
+                continue
+            keep = int(fin + math.ceil(((cur - fin) * (1.0 - p)) - 1e-9))
+            out[str(name)] = max(fin, min(cur, keep))
+        return out
+
+    def _interpolate_architecture(
+        self,
+        current_arch: Dict[str, Any],
+        final_arch: Dict[str, Any],
+        progress: float,
+    ) -> Dict[str, Any]:
+        return {
+            "conv_out_channels": self._interpolate_width_map(
+                dict(current_arch.get("conv_out_channels", {}) or {}),
+                dict(final_arch.get("conv_out_channels", {}) or {}),
+                progress,
+            ),
+            "detect_hidden_channels": self._interpolate_width_map(
+                dict(current_arch.get("detect_hidden_channels", {}) or {}),
+                dict(final_arch.get("detect_hidden_channels", {}) or {}),
+                progress,
+            ),
+            # During intermediate stages this is a width target, not an exact param target.
+            "total_params": int(final_arch.get("total_params", 0) or 0),
+        }
+
+    @staticmethod
+    def _architecture_mismatch_summary(
+        actual_arch: Dict[str, Any],
+        target_arch: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        def _diff(actual: Dict[str, Any], target: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+            return {
+                str(k): {"target": int(v), "actual": int(actual.get(k, -1))}
+                for k, v in dict(target or {}).items()
+                if int(actual.get(k, -1)) != int(v)
+            }
+
+        conv = _diff(
+            dict(actual_arch.get("conv_out_channels", {}) or {}),
+            dict(target_arch.get("conv_out_channels", {}) or {}),
+        )
+        detect = _diff(
+            dict(actual_arch.get("detect_hidden_channels", {}) or {}),
+            dict(target_arch.get("detect_hidden_channels", {}) or {}),
+        )
+        return {
+            "conv_mismatch_count": int(len(conv)),
+            "detect_mismatch_count": int(len(detect)),
+            "conv_mismatches": conv,
+            "detect_mismatches": detect,
+            "actual_total_params": int(actual_arch.get("total_params", 0) or 0),
+            "target_total_params": int(target_arch.get("total_params", 0) or 0),
+        }
+
+    def _build_one_shot_target_architecture(self, cand: CandidateConfig) -> Dict[str, Any]:
+        if self.extract_pruning_architecture_fn is None:
+            raise RuntimeError(
+                "staged_pruning.target_mode='match_one_shot_architecture' requires "
+                "extract_pruning_architecture_fn"
+            )
+        shadow = self.build_candidate_fn(cand)
+        try:
+            return dict(self.extract_pruning_architecture_fn(shadow) or {})
+        finally:
+            try:
+                del shadow
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _build_and_recover_student(
+        self,
+        cand: CandidateConfig,
+        extra: Dict[str, Any],
+    ) -> tuple[Any, Optional[float]]:
+        mode = self._prune_mode()
+        if mode != "staged" or float(cand.prune_ratio) <= 0.0:
+            student = self.build_candidate_fn(cand)
+            self.warmstart_fn(student)
+            self._collect_student_transform_stats(student, extra)
+
+            finetune_logs = self.finetune_fn(student, self.train_cfg)
+            if isinstance(finetune_logs, dict):
+                extra["finetune_logs"] = finetune_logs
+            extra["pruning_mode"] = "one_shot"
+            return student, None
+
+        if self.apply_pruning_stage_fn is None:
+            raise RuntimeError("trim.prune_mode='staged' requires apply_pruning_stage_fn")
+
+        plan = self._build_pruning_plan(float(cand.prune_ratio))
+        if not plan:
+            raise RuntimeError("staged pruning requested, but no pruning plan was built")
+
+        target_mode = self._staged_target_mode()
+        one_shot_target_arch: Optional[Dict[str, Any]] = None
+        if target_mode == "match_one_shot_architecture":
+            one_shot_target_arch = self._build_one_shot_target_architecture(cand)
+
+        first = plan[0]
+        first_cand = dataclasses.replace(cand, prune_ratio=float(first["local_ratio"]))
+        student = self.build_candidate_fn(first_cand)
+        self.warmstart_fn(student)
+
+        stages: List[Dict[str, Any]] = []
+        final_acc: Optional[float] = None
+        eval_each_stage = bool(getattr(self.staged_pruning_cfg, "eval_after_each_stage", True))
+        final_target_total = float(plan[-1]["target_total"])
+
+        for i, stage in enumerate(plan):
+            is_final = i == len(plan) - 1
+            stage_label = f"staged_{i + 1}"
+            stage_target_arch: Optional[Dict[str, Any]] = None
+            target_progress: Optional[float] = None
+
+            if i == 0:
+                stage_trim_stats = getattr(getattr(student, "yolo", None), "_xtrim_trim_stats", None)
+            else:
+                if target_mode == "match_one_shot_architecture":
+                    if self.extract_pruning_architecture_fn is None or one_shot_target_arch is None:
+                        raise RuntimeError("missing target architecture callback/state")
+                    current_arch = dict(self.extract_pruning_architecture_fn(student) or {})
+                    denom = max(1e-12, final_target_total - float(stage["previous_total"]))
+                    target_progress = min(
+                        1.0,
+                        max(0.0, (float(stage["target_total"]) - float(stage["previous_total"])) / denom),
+                    )
+                    stage_target_arch = self._interpolate_architecture(
+                        current_arch,
+                        one_shot_target_arch,
+                        target_progress,
+                    )
+                if stage_target_arch is None:
+                    stage_trim_stats = self.apply_pruning_stage_fn(
+                        student,
+                        float(stage["local_ratio"]),
+                        stage_label,
+                    )
+                else:
+                    stage_trim_stats = self.apply_pruning_stage_fn(
+                        student,
+                        float(stage["local_ratio"]),
+                        stage_label,
+                        target_architecture=stage_target_arch,
+                    )
+
+            stage_acc_before: Optional[float] = None
+            if eval_each_stage:
+                stage_acc_before = float(self.eval_acc_fn(student))
+
+            stage_train_cfg = self._stage_train_cfg(is_final=is_final)
+            stage_logs = self.finetune_fn(student, stage_train_cfg)
+
+            stage_rec: Dict[str, Any] = {
+                **stage,
+                "stage_label": stage_label,
+                "is_final": bool(is_final),
+                "train_epochs": int(stage_train_cfg.short_epochs),
+                "train_lr": float(stage_train_cfg.lr),
+            }
+            if target_progress is not None:
+                stage_rec["target_progress_to_one_shot"] = float(target_progress)
+            if stage_target_arch is not None:
+                stage_rec["target_architecture"] = stage_target_arch
+            if stage_acc_before is not None:
+                stage_rec["acc_before_recovery"] = stage_acc_before
+            if stage_trim_stats is not None:
+                stage_rec["trim_stats"] = stage_trim_stats
+            if isinstance(stage_logs, dict):
+                stage_rec["finetune_logs"] = stage_logs
+
+            if eval_each_stage:
+                stage_acc = float(self.eval_acc_fn(student))
+                stage_rec["acc_after_recovery"] = stage_acc
+                if is_final:
+                    final_acc = stage_acc
+
+            stages.append(stage_rec)
+
+        self._collect_student_transform_stats(student, extra)
+        extra["pruning_mode"] = "staged"
+        staged_extra: Dict[str, Any] = {
+            "milestones": [float(v) for v in getattr(self.staged_pruning_cfg, "milestones", ())],
+            "target_mode": target_mode,
+            "plan": plan,
+            "stages": stages,
+        }
+        if one_shot_target_arch is not None:
+            staged_extra["one_shot_target_architecture"] = one_shot_target_arch
+            if self.extract_pruning_architecture_fn is not None:
+                achieved_arch = dict(self.extract_pruning_architecture_fn(student) or {})
+                staged_extra["final_architecture"] = achieved_arch
+                staged_extra["final_architecture_match"] = self._architecture_mismatch_summary(
+                    achieved_arch,
+                    one_shot_target_arch,
+                )
+        extra["staged_pruning"] = staged_extra
+        if stages and isinstance(stages[-1].get("finetune_logs"), dict):
+            extra["finetune_logs"] = stages[-1]["finetune_logs"]
+        return student, final_acc
+
+
+    def _process_candidate(self, cand: CandidateConfig, run_dir: Path) -> HistoryItem:
+        extra: Dict[str, Any] = {}
+        student, precomputed_acc = self._build_and_recover_student(cand, extra)
+
+        acc = float(precomputed_acc) if precomputed_acc is not None else float(self.eval_acc_fn(student))
         extra["acc_kind"] = "mAP50-95"
 
         try:

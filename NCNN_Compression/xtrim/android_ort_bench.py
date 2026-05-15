@@ -48,13 +48,17 @@ class AndroidOrtBench:
             pass
 
     def _extract_last_json(self, text: str) -> Optional[dict]:
+        decoder = json.JSONDecoder()
         found: List[dict] = []
-        for m in re.finditer(r"\{.*\}", text, flags=re.DOTALL):
-            s = m.group(0)
-            try:
-                found.append(json.loads(s))
-            except Exception:
+        for start, ch in enumerate(text):
+            if ch != "{":
                 continue
+            try:
+                obj, _end = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                found.append(obj)
         return found[-1] if found else None
 
     def run_once(self, *, device: DeviceConfig, local_onnx: Path) -> dict:

@@ -9,7 +9,11 @@ from typing import Any, Callable, Optional
 import torch
 from onnx import StringStringEntryProto
 
-from .detect_head_pruning import shrink_detect_heads
+from .detect_head_pruning import (
+    shrink_detect_heads,
+    shrink_detect_heads_to_targets,
+    collect_detect_head_hidden_channels,
+)
 from ..types import (
     CandidateConfig,
     ModelConfig,
@@ -26,7 +30,7 @@ from ..types import (
     DilatedConfig,
 )
 from ..utils import ensure_dir
-from ..trim.slim import structured_trim_yolo
+from ..trim.slim import structured_trim_yolo, collect_prunable_out_channels
 from ..trim.lowrank import apply_lowrank_decomposition, recalibrate_bn
 from ..trim.sparse_1x1 import apply_1x1_weight_sparsity, remove_pruning_reparam
 from ..trim.operator_choice import apply_operator_plan, plan_from_config
@@ -101,6 +105,44 @@ def _build_recalib_loader(model_cfg: ModelConfig, batch: int = 4, workers: int =
         stride=int(model_stride),
     )
     return build_dataloader(dataset, batch, workers, shuffle=True, rank=-1)
+
+
+def _normalize_optional_regex(v, field_name: str):
+    if v is None or v is False or v == "":
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else None
+    raise TypeError(f"{field_name} must be null/false or a regex string, got {type(v).__name__}")
+
+
+def extract_ultralytics_pruning_architecture(
+    student: UltralyticsStudent,
+    trim_cfg: TrimConfig,
+) -> dict:
+    """Describe the structural widths that matter for pruning comparisons."""
+    torch_model = student.torch_model
+    exclude_name_regex = _normalize_optional_regex(
+        getattr(trim_cfg, "exclude_name_regex", None), "trim.exclude_name_regex"
+    )
+    include_inner_m_regex = _normalize_optional_regex(
+        getattr(trim_cfg, "include_inner_m_regex", None), "trim.include_inner_m_regex"
+    )
+    conv_out_channels = collect_prunable_out_channels(
+        torch_model,
+        exclude_head=bool(trim_cfg.exclude_head),
+        exclude_name_regex=exclude_name_regex,
+        skip_inner_m=bool(getattr(trim_cfg, "skip_inner_m", True)),
+        skip_cv1_if_parent_has_m=bool(getattr(trim_cfg, "skip_cv1_if_parent_has_m", True)),
+        include_inner_m_regex=include_inner_m_regex,
+    )
+    return {
+        "conv_out_channels": {str(k): int(v) for k, v in conv_out_channels.items()},
+        "detect_hidden_channels": {
+            str(k): int(v) for k, v in collect_detect_head_hidden_channels(torch_model).items()
+        },
+        "total_params": int(sum(p.numel() for p in torch_model.parameters())),
+    }
 
 
 def build_ultralytics_candidate(
@@ -563,6 +605,204 @@ def build_ultralytics_candidate(
     return UltralyticsStudent(yolo=yolo, torch_model=torch_model)
 
 
+def apply_ultralytics_pruning_stage(
+    student: UltralyticsStudent,
+    *,
+    stage_prune_ratio: float,
+    model_cfg: ModelConfig,
+    trim_cfg: TrimConfig,
+    stage_label: str,
+    target_architecture: Optional[dict] = None,
+) -> dict:
+    """Apply one additional BN-gamma pruning stage to an existing student.
+
+    ``stage_prune_ratio`` is local to the *current* model, not cumulative with
+    respect to the original model. The orchestrator is responsible for turning
+    cumulative milestones into these local ratios.
+    """
+    import torch
+
+    if not (0.0 < float(stage_prune_ratio) < 1.0):
+        raise ValueError(f"stage_prune_ratio must be in (0, 1), got {stage_prune_ratio}")
+
+    def _normalize_regex(v, field_name: str):
+        if v is None or v is False or v == "":
+            return None
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else None
+        raise TypeError(f"{field_name} must be null/false or a regex string, got {type(v).__name__}")
+
+    def _count_params(model) -> int:
+        return sum(p.numel() for p in model.parameters())
+
+    def _count_trainable_params(model) -> int:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    def _top_param_modules(model, topk: int = 20):
+        rows = []
+        for name, module in model.named_modules():
+            own_params = sum(p.numel() for p in module.parameters(recurse=False))
+            if own_params > 0:
+                rows.append((name, module.__class__.__name__, own_params))
+        rows.sort(key=lambda x: x[2], reverse=True)
+        return rows[:topk]
+
+    def _param_snapshot(model, label: str, topk: int = 20) -> dict:
+        total = _count_params(model)
+        trainable = _count_trainable_params(model)
+        print(f"[params] {label}: total={total:,} trainable={trainable:,}")
+        top_rows = _top_param_modules(model, topk=topk)
+        return {
+            "label": label,
+            "total_params": int(total),
+            "trainable_params": int(trainable),
+            "top_modules": [
+                {"name": name if name else "<root>", "type": cls_name, "params": int(n)}
+                for name, cls_name, n in top_rows
+            ],
+        }
+
+    torch_model = student.torch_model
+    torch_model.eval()
+    dev = next(torch_model.parameters()).device
+    x = torch.randn(1, 3, int(model_cfg.imgsz), int(model_cfg.imgsz), device=dev)
+
+    all_stats = dict(getattr(student.yolo, "_xtrim_all_stats", {}) or {})
+    exclude_name_regex = _normalize_regex(
+        getattr(trim_cfg, "exclude_name_regex", None), "trim.exclude_name_regex"
+    )
+    include_inner_m_regex = _normalize_regex(
+        getattr(trim_cfg, "include_inner_m_regex", None), "trim.include_inner_m_regex"
+    )
+    skip_inner_m = bool(getattr(trim_cfg, "skip_inner_m", True))
+    skip_cv1_if_parent_has_m = bool(getattr(trim_cfg, "skip_cv1_if_parent_has_m", True))
+    strategy = str(getattr(trim_cfg, "strategy", "layerwise"))
+    max_prune_per_layer = getattr(trim_cfg, "max_prune_per_layer", None)
+    protect_last_n = int(getattr(trim_cfg, "protect_last_n", 0) or 0)
+
+    params_initial = int(
+        (all_stats.get("params_initial") or {}).get("total_params", _count_params(torch_model))
+    )
+    params_before = _count_params(torch_model)
+
+    target_architecture = dict(target_architecture or {})
+    target_out_channels = dict(target_architecture.get("conv_out_channels", {}) or {})
+    target_detect_hidden = dict(target_architecture.get("detect_hidden_channels", {}) or {})
+
+    print(
+        f"[staged] Applying {stage_label}: local prune_ratio={float(stage_prune_ratio):.6f} "
+        f"(BN-gamma importance, target_arch={bool(target_architecture)})"
+    )
+    stats = structured_trim_yolo(
+        torch_model,
+        example_input=x,
+        prune_ratio=float(stage_prune_ratio),
+        channel_round=int(trim_cfg.channel_round),
+        min_channels=int(trim_cfg.min_channels),
+        exclude_head=bool(trim_cfg.exclude_head),
+        exclude_name_regex=exclude_name_regex,
+        strategy=strategy,
+        max_prune_per_layer=max_prune_per_layer,
+        protect_last_n=protect_last_n,
+        verbose=True,
+        importance_mode="bn_gamma",
+        skip_inner_m=skip_inner_m,
+        skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+        include_inner_m_regex=include_inner_m_regex,
+        target_out_channels=target_out_channels or None,
+    )
+
+    params_after = _count_params(torch_model)
+    stage_comp = params_before / max(1, params_after)
+    total_comp = params_initial / max(1, params_after)
+
+    stats = dict(stats or {})
+    stats.update(
+        {
+            "params_before": int(params_before),
+            "params_after": int(params_after),
+            "compression_ratio_stage": float(stage_comp),
+            "compression_ratio_total": float(total_comp),
+            "target_architecture_applied": bool(target_architecture),
+        }
+    )
+    all_stats[f"{stage_label}_bn_prune"] = stats
+
+    round_to = max(int(getattr(trim_cfg, "channel_round", 8) or 8), 8)
+    min_channels = max(int(getattr(trim_cfg, "min_channels", 8) or 8), 8)
+    psa_stats = shrink_psa_family_blocks(
+        torch_model,
+        prune_ratio=float(stage_prune_ratio),
+        round_to=round_to,
+        min_channels=min_channels,
+        verbose=True,
+    )
+    all_stats[f"{stage_label}_composite_psa"] = psa_stats
+
+    if bool(getattr(trim_cfg, "exclude_head", True)):
+        detect_stats = {
+            "heads_shrunk": 0,
+            "channels_pruned": 0,
+            "skipped": "trim.exclude_head=true",
+        }
+        print(f"[staged] Detect head prune ({stage_label}): skipped because trim.exclude_head=true")
+    elif target_detect_hidden:
+        detect_stats = shrink_detect_heads_to_targets(
+            torch_model,
+            target_hidden_channels=target_detect_hidden,
+            round_to=round_to,
+            min_channels=min_channels,
+            verbose=True,
+        )
+    else:
+        detect_stats = shrink_detect_heads(
+            torch_model,
+            prune_ratio=float(stage_prune_ratio),
+            round_to=round_to,
+            min_channels=min_channels,
+            verbose=True,
+        )
+    all_stats[f"{stage_label}_detect_head"] = detect_stats
+
+    with torch.no_grad():
+        _ = torch_model(x)
+
+    all_stats[f"params_after_{stage_label}_bn_prune"] = _param_snapshot(
+        torch_model, f"after_{stage_label}", topk=20
+    )
+    all_stats["params_final"] = _param_snapshot(torch_model, "final", topk=20)
+
+    if target_architecture:
+        achieved_arch = extract_ultralytics_pruning_architecture(student, trim_cfg)
+        conv_target = dict(target_architecture.get("conv_out_channels", {}) or {})
+        detect_target = dict(target_architecture.get("detect_hidden_channels", {}) or {})
+        conv_actual = dict(achieved_arch.get("conv_out_channels", {}) or {})
+        detect_actual = dict(achieved_arch.get("detect_hidden_channels", {}) or {})
+        conv_mismatches = {
+            k: {"target": int(v), "actual": int(conv_actual.get(k, -1))}
+            for k, v in conv_target.items()
+            if int(conv_actual.get(k, -1)) != int(v)
+        }
+        detect_mismatches = {
+            k: {"target": int(v), "actual": int(detect_actual.get(k, -1))}
+            for k, v in detect_target.items()
+            if int(detect_actual.get(k, -1)) != int(v)
+        }
+        stats["target_match"] = {
+            "conv_mismatch_count": int(len(conv_mismatches)),
+            "detect_mismatch_count": int(len(detect_mismatches)),
+            "conv_mismatches": conv_mismatches,
+            "detect_mismatches": detect_mismatches,
+            "achieved_total_params": int(achieved_arch.get("total_params", 0)),
+            "target_total_params": int(target_architecture.get("total_params", 0) or 0),
+        }
+
+    setattr(student.yolo, "_xtrim_trim_stats", stats)
+    setattr(student.yolo, "_xtrim_all_stats", all_stats)
+    return stats
+
+
 def finetune_noop(student: UltralyticsStudent, train_cfg: TrainConfig) -> None:
     return
 
@@ -892,6 +1132,15 @@ def _inject_ultralytics_metadata(onnx_path: Path, student: Any, model_cfg: Any) 
 
 def save_student_torchscript(student: UltralyticsStudent, pt_path: Path) -> None:
     student.torch_model.eval()
-    scripted = torch.jit.script(student.torch_model)
+    try:
+        scripted = torch.jit.script(student.torch_model)
+    except (OSError, RuntimeError):
+        # Dynamically-created test models and some wrapped runtime modules have no
+        # inspectable Python source, so scripting may fail even when tracing is fine.
+        first_param = next(student.torch_model.parameters(), None)
+        dev = first_param.device if first_param is not None else torch.device("cpu")
+        dt = first_param.dtype if first_param is not None else torch.float32
+        dummy = torch.randn(1, 3, 640, 640, device=dev, dtype=dt)
+        scripted = torch.jit.trace(student.torch_model, dummy, strict=False)
     ensure_dir(pt_path.parent)
     scripted.save(str(pt_path))

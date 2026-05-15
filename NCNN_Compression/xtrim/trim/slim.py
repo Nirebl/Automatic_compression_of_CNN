@@ -192,6 +192,57 @@ def _collect_prunable_convs(
     return prunable
 
 
+def collect_prunable_out_channels(
+    torch_model: Any,
+    *,
+    exclude_head: bool,
+    exclude_name_regex: Optional[str],
+    skip_inner_m: bool = True,
+    skip_cv1_if_parent_has_m: bool = True,
+    include_inner_m_regex: Optional[str] = None,
+) -> Dict[str, int]:
+    """Return current output widths for the generic structurally-prunable Conv modules."""
+    return {
+        name: int(getattr(m, "conv").out_channels)
+        for name, m in _collect_prunable_convs(
+            torch_model,
+            exclude_head=exclude_head,
+            exclude_name_regex=exclude_name_regex,
+            skip_inner_m=skip_inner_m,
+            skip_cv1_if_parent_has_m=skip_cv1_if_parent_has_m,
+            include_inner_m_regex=include_inner_m_regex,
+        )
+    }
+
+
+def _select_prune_idxs_to_keep_count(
+    bn,
+    target_keep: int,
+    min_channels: int,
+    *,
+    importance_mode: str = "bn_gamma",
+    conv: Optional[Any] = None,
+) -> List[int]:
+    """Select channels to prune so that exactly ``target_keep`` outputs remain."""
+    import torch
+
+    if importance_mode == "uniform" and conv is not None:
+        weight = conv.weight.detach()
+        C = int(weight.shape[0])
+        g = weight.view(C, -1).norm(dim=1)
+    else:
+        g = bn.weight.detach().abs()
+        C = int(g.numel())
+
+    keep = max(int(min_channels), min(C, int(target_keep)))
+    if keep >= C:
+        return []
+
+    keep_idx = torch.topk(g, k=keep, largest=True).indices.tolist()
+    keep_set = set(keep_idx)
+    return [i for i in range(C) if i not in keep_set]
+
+
 def _global_threshold_from_bn_gammas(prunable: List[Tuple[str, Any]], prune_ratio: float) -> float:
     all_g = []
     for _, m in prunable:
@@ -567,6 +618,7 @@ def structured_trim_yolo(
     skip_cv1_if_parent_has_m: bool = True,
     include_inner_m_regex: Optional[str] = None,
     importance_mode: str = "bn_gamma",
+    target_out_channels: Optional[Dict[str, int]] = None,
 ) -> dict[str, int] | dict[str, int | list[str]]:
     if not (0.0 < prune_ratio < 0.95):
         raise ValueError("prune_ratio must be in (0, 0.95)")
@@ -637,8 +689,10 @@ def structured_trim_yolo(
     if strategy not in ("layerwise", "global"):
         strategy = "layerwise"
 
+    target_out_channels = dict(target_out_channels or {})
+
     thr = 0.0
-    if strategy == "global":
+    if strategy == "global" and not target_out_channels:
         thr = _global_threshold_from_bn_gammas(initial_prunable, prune_ratio)
 
     dg = _build_dependency_graph(tp, torch_model, example_input)
@@ -684,7 +738,15 @@ def structured_trim_yolo(
                 print(f"[trim] skip {name}: unsupported grouped conv (groups={conv.groups})")
             continue
 
-        if strategy == "global":
+        if name in target_out_channels:
+            idxs = _select_prune_idxs_to_keep_count(
+                bn,
+                target_keep=int(target_out_channels[name]),
+                min_channels=min_channels,
+                importance_mode=importance_mode,
+                conv=conv,
+            )
+        elif strategy == "global":
             idxs = _select_prune_idxs_by_gamma(bn, thr, channel_round, min_channels)
 
             cap = max_prune_per_layer
@@ -769,7 +831,15 @@ def structured_trim_yolo(
                 continue
 
             # Пересчитываем idxs на АКТУАЛЬНОМ bn/conv
-            if strategy == "global":
+            if name in target_out_channels:
+                idxs = _select_prune_idxs_to_keep_count(
+                    bn,
+                    target_keep=int(target_out_channels[name]),
+                    min_channels=min_channels,
+                    importance_mode=importance_mode,
+                    conv=conv,
+                )
+            elif strategy == "global":
                 idxs = _select_prune_idxs_by_gamma(bn, thr, channel_round, min_channels)
 
                 cap = max_prune_per_layer
@@ -848,4 +918,5 @@ def structured_trim_yolo(
         "channels_pruned": channels_pruned,
         "prunable_count": len(prunable_names),
         "pruned_layer_names": pruned_layer_names,
+        "targeted": bool(target_out_channels),
     }

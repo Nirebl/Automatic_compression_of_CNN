@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 import copy
 
 import torch
@@ -118,11 +118,16 @@ def _shrink_box_branch(
     prune_ratio: float,
     round_to: int,
     min_channels: int,
+    target_hidden: Optional[int] = None,
 ) -> Tuple[nn.Sequential, Dict[str, int]]:
     in_ch = int(old_branch[0].conv.in_channels)
     old_hidden = int(old_branch[0].conv.out_channels)
 
-    keep = _target_keep(old_hidden, prune_ratio, round_to=round_to, min_channels=min_channels)
+    keep = (
+        max(int(min_channels), min(old_hidden, int(target_hidden)))
+        if target_hidden is not None
+        else _target_keep(old_hidden, prune_ratio, round_to=round_to, min_channels=min_channels)
+    )
     if keep >= old_hidden:
         return copy.deepcopy(old_branch), {"hidden_old": old_hidden, "hidden_new": old_hidden, "shrunk": 0}
 
@@ -146,6 +151,7 @@ def _shrink_cls_branch(
     prune_ratio: float,
     round_to: int,
     min_channels: int,
+    target_hidden: Optional[int] = None,
 ) -> Tuple[nn.Sequential, Dict[str, int]]:
     layout = _cls_branch_layout(old_branch)
 
@@ -167,7 +173,11 @@ def _shrink_cls_branch(
     else:
         raise ValueError(f"Unsupported cls branch layout: {layout}")
 
-    keep = _target_keep(old_hidden, prune_ratio, round_to=round_to, min_channels=min_channels)
+    keep = (
+        max(int(min_channels), min(old_hidden, int(target_hidden)))
+        if target_hidden is not None
+        else _target_keep(old_hidden, prune_ratio, round_to=round_to, min_channels=min_channels)
+    )
     if keep >= old_hidden:
         return copy.deepcopy(old_branch), {"hidden_old": old_hidden, "hidden_new": old_hidden, "shrunk": 0}
 
@@ -315,3 +325,150 @@ def shrink_detect_heads(
             items.extend(list(sub.get("items", [])))
 
     return {"heads_shrunk": replaced, "items": items}
+
+
+def _box_hidden(branch: nn.Sequential) -> int:
+    return int(branch[0].conv.out_channels)
+
+
+def _cls_hidden(branch: nn.Sequential) -> int:
+    layout = _cls_branch_layout(branch)
+    if layout == "legacy":
+        return int(branch[0].conv.out_channels)
+    if layout == "dw":
+        return int(branch[0][1].conv.out_channels)
+    raise ValueError(f"Unsupported cls branch layout: {layout}")
+
+
+def collect_detect_head_hidden_channels(module: nn.Module) -> Dict[str, int]:
+    """Collect hidden widths for every Detect box/classification branch."""
+    widths: Dict[str, int] = {}
+    for name, child in module.named_modules():
+        if not isinstance(child, Detect):
+            continue
+        prefix = name if name else "<root>"
+        for i in range(child.nl):
+            widths[f"{prefix}.cv2[{i}]"] = _box_hidden(child.cv2[i])
+            widths[f"{prefix}.cv3[{i}]"] = _cls_hidden(child.cv3[i])
+        if hasattr(child, "one2one_cv2") and hasattr(child, "one2one_cv3"):
+            for i in range(child.nl):
+                widths[f"{prefix}.one2one_cv2[{i}]"] = _box_hidden(child.one2one_cv2[i])
+                widths[f"{prefix}.one2one_cv3[{i}]"] = _cls_hidden(child.one2one_cv3[i])
+    return widths
+
+
+def _shrink_detect_head_to_targets_impl(
+    head: Detect,
+    *,
+    prefix: str,
+    target_hidden_channels: Dict[str, int],
+    round_to: int,
+    min_channels: int,
+    verbose: bool,
+) -> Tuple[Detect, Dict[str, Any]]:
+    new_head = copy.deepcopy(head)
+    new_head.train(head.training)
+
+    items: List[Dict[str, Any]] = []
+    changed = 0
+
+    for i in range(head.nl):
+        box_key = f"{prefix}.cv2[{i}]"
+        cls_key = f"{prefix}.cv3[{i}]"
+        box_new, box_info = _shrink_box_branch(
+            head.cv2[i],
+            reg_max=int(head.reg_max),
+            prune_ratio=0.0,
+            round_to=round_to,
+            min_channels=min_channels,
+            target_hidden=target_hidden_channels.get(box_key),
+        )
+        cls_new, cls_info = _shrink_cls_branch(
+            head.cv3[i],
+            nc=int(head.nc),
+            prune_ratio=0.0,
+            round_to=round_to,
+            min_channels=min_channels,
+            target_hidden=target_hidden_channels.get(cls_key),
+        )
+        new_head.cv2[i] = box_new
+        new_head.cv3[i] = cls_new
+
+        if box_info["shrunk"] > 0:
+            changed += 1
+            items.append({"branch": box_key, **box_info})
+            if verbose:
+                print(f"[detect-target] {box_key}: hidden {box_info['hidden_old']} -> {box_info['hidden_new']}")
+        if cls_info["shrunk"] > 0:
+            changed += 1
+            items.append({"branch": cls_key, **cls_info})
+            if verbose:
+                print(f"[detect-target] {cls_key}: hidden {cls_info['hidden_old']} -> {cls_info['hidden_new']}")
+
+    if hasattr(head, "one2one_cv2") and hasattr(head, "one2one_cv3"):
+        for i in range(head.nl):
+            box_key = f"{prefix}.one2one_cv2[{i}]"
+            cls_key = f"{prefix}.one2one_cv3[{i}]"
+            box_new, box_info = _shrink_box_branch(
+                head.one2one_cv2[i],
+                reg_max=int(head.reg_max),
+                prune_ratio=0.0,
+                round_to=round_to,
+                min_channels=min_channels,
+                target_hidden=target_hidden_channels.get(box_key),
+            )
+            cls_new, cls_info = _shrink_cls_branch(
+                head.one2one_cv3[i],
+                nc=int(head.nc),
+                prune_ratio=0.0,
+                round_to=round_to,
+                min_channels=min_channels,
+                target_hidden=target_hidden_channels.get(cls_key),
+            )
+            new_head.one2one_cv2[i] = box_new
+            new_head.one2one_cv3[i] = cls_new
+            if box_info["shrunk"] > 0:
+                changed += 1
+                items.append({"branch": box_key, **box_info})
+            if cls_info["shrunk"] > 0:
+                changed += 1
+                items.append({"branch": cls_key, **cls_info})
+
+    return new_head, {"branches_shrunk": changed, "items": items}
+
+
+def shrink_detect_heads_to_targets(
+    module: nn.Module,
+    *,
+    target_hidden_channels: Dict[str, int],
+    round_to: int = 8,
+    min_channels: int = 8,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """Shrink Detect hidden branches to exact target widths where possible."""
+    items: List[Dict[str, Any]] = []
+    replaced = 0
+
+    def _recurse(parent: nn.Module, prefix: str = "") -> None:
+        nonlocal replaced
+        for name, child in list(parent.named_children()):
+            qn = f"{prefix}.{name}" if prefix else name
+            if isinstance(child, Detect):
+                new_child, stats = _shrink_detect_head_to_targets_impl(
+                    child,
+                    prefix=qn,
+                    target_hidden_channels=target_hidden_channels,
+                    round_to=round_to,
+                    min_channels=min_channels,
+                    verbose=verbose,
+                )
+                setattr(parent, name, new_child)
+                replaced += 1
+                items.append({"name": qn, **stats})
+                if verbose:
+                    print(f"[detect-target] Detect head at {qn}: {stats['branches_shrunk']} branches shrunk")
+            else:
+                _recurse(child, qn)
+
+    _recurse(module)
+    return {"heads_shrunk": replaced, "items": items, "targeted": True}

@@ -153,6 +153,10 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrimConfig:
+    # How the final prune_ratio is reached:
+    # - one_shot: remove all requested channels in one operation;
+    # - staged: approach the same final target through intermediate milestones.
+    prune_mode: str = "one_shot"
     channel_round: int = 8
     min_channels: int = 8
     exclude_head: bool = True
@@ -165,6 +169,31 @@ class TrimConfig:
     skip_cv1_if_parent_has_m: bool = True
     include_inner_m_regex: Optional[str] = None
     adapt_c2f_for_pruning: bool = False
+
+
+@dataclass(frozen=True)
+class StagedPruningConfig:
+    # Cumulative pruning targets relative to the original model.
+    # The candidate's final prune_ratio is appended automatically, so it should
+    # normally not be duplicated here.
+    milestones: tuple = ()
+
+    # How staged pruning interprets milestones:
+    # - ratio_schedule: every stage uses only its local pruning ratio;
+    # - match_one_shot_architecture: the final one-shot architecture is built on
+    #   a shadow copy and staged pruning is forced to reach the same final widths.
+    target_mode: str = "ratio_schedule"
+
+    # Recovery settings for all non-final stages. Final stage falls back to the
+    # regular train config unless final_epochs/final_lr are explicitly set.
+    intermediate_epochs: int = 30
+    intermediate_lr: Optional[float] = None
+    final_epochs: Optional[int] = None
+    final_lr: Optional[float] = None
+
+    # Evaluating every stage is slower, but makes the whole pruning trajectory
+    # visible in history.jsonl.
+    eval_after_each_stage: bool = True
 
 
 @dataclass(frozen=True)
