@@ -27,7 +27,12 @@ except Exception:
     C2fPSA = None  # type: ignore
 
 
-PSA_FAMILY_CLASSNAMES = {"Attention", "PSABlock", "PSA", "C2PSA", "C2fPSA"}
+PSA_FAMILY_CLASSNAMES = {
+    "Attention", "PSABlock", "PSA", "C2PSA", "C2fPSA",
+    # xtrim pruning adapters. These classes preserve PSA/C2PSA split/chunk
+    # invariants and must be handled atomically, not by generic Conv pruning.
+    "PSABlockPrunable", "PSAPrunable", "C2PSAPrunable", "C2fPSAPrunable",
+}
 
 
 def _class_name(m: Any) -> str:
@@ -774,11 +779,11 @@ def _shrink_composite_module(
     # A standalone PSABlock may live inside a larger carrier/container
     # whose surrounding convs are still unchanged. Replacing only the block
     # breaks input channel compatibility (e.g. block expects 56, parent still feeds 256).
-    if name == "PSA":
+    if name in {"PSA", "PSAPrunable"}:
         return _shrink_psa(module, prune_ratio, round_to, min_channels)
-    if name == "C2PSA":
+    if name in {"C2PSA", "C2PSAPrunable"}:
         return _shrink_c2psa(module, prune_ratio, round_to, min_channels)
-    if name == "C2fPSA":
+    if name in {"C2fPSA", "C2fPSAPrunable"}:
         return _shrink_c2fpsa(module, prune_ratio, round_to, min_channels)
 
     return module, None
@@ -801,7 +806,7 @@ def shrink_psa_family_blocks(
 
     for name, child in list(module.named_children()):
         cls = _class_name(child)
-        if cls in {"PSA", "C2PSA", "C2fPSA"}:
+        if cls in {"PSA", "C2PSA", "C2fPSA", "PSAPrunable", "C2PSAPrunable", "C2fPSAPrunable"}:
             new_child, info = _shrink_composite_module(
                 child,
                 prune_ratio=prune_ratio,

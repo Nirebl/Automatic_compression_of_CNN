@@ -889,6 +889,20 @@ class XTrimOrchestrator:
             if isinstance(qat_logs, dict):
                 extra["qat_logs"] = qat_logs
 
+            # finetune_qat_recover() normally disables fake-quant at the end,
+            # but keep this explicit here so the exported QAT model is always
+            # a clean deploy candidate with trained weights, not a graph with
+            # training-time fake-quant operators accidentally left enabled.
+            try:
+                from .quant.fake_quant_ultra import set_fake_quant_enabled
+
+                torch_model_qat = getattr(student, "torch_model", None)
+                if torch_model_qat is not None:
+                    set_fake_quant_enabled(torch_model_qat, False)
+                    extra["qat_fake_quant_disabled_before_export"] = True
+            except Exception as _fq_err:
+                extra["qat_fake_quant_disable_warning"] = str(_fq_err)
+
             onnx_qat = run_dir / "export" / "model_qat.onnx"
             exporter_qat = Exporter(self.export_onnx_fn_factory(student, self.export_cfg))
             exporter_qat.export_onnx(onnx_qat)
@@ -915,6 +929,30 @@ class XTrimOrchestrator:
 
         extra["deploy_onnx_path"] = str(deploy_onnx)
         extra["deploy_onnx_kind"] = deploy_onnx_kind
+
+        # Metric used for Pareto/scalar/history must describe the same artifact
+        # that is measured for size and latency. Previously metrics.acc stayed
+        # at the pre-QAT FP32 recovery score, while size/latency could belong
+        # to model_int8_after_qat.onnx. That made FINAL RESULTS and Pareto
+        # compare different deploy artifacts.
+        deploy_acc = float(acc)
+        deploy_acc_source = "recovered_torch"
+        if deploy_onnx_kind == "int8_after_qat" and "acc_onnx_int8_after_qat" in extra:
+            deploy_acc = float(extra["acc_onnx_int8_after_qat"])
+            deploy_acc_source = "acc_onnx_int8_after_qat"
+        elif deploy_onnx_kind == "qat_fp32" and "acc_onnx_after_qat" in extra:
+            deploy_acc = float(extra["acc_onnx_after_qat"])
+            deploy_acc_source = "acc_onnx_after_qat"
+        elif deploy_onnx_kind == "int8_before_qat" and "acc_onnx_int8" in extra:
+            deploy_acc = float(extra["acc_onnx_int8"])
+            deploy_acc_source = "acc_onnx_int8"
+        elif deploy_onnx_kind == "fp32" and "acc_onnx" in extra:
+            deploy_acc = float(extra["acc_onnx"])
+            deploy_acc_source = "acc_onnx"
+
+        extra["acc_recovered_torch"] = float(acc)
+        extra["acc_deploy"] = float(deploy_acc)
+        extra["acc_deploy_source"] = deploy_acc_source
 
         size_bytes = int(sizeof_file(onnx_path))
         latency_ms: Dict[str, float] = {}
@@ -978,10 +1016,10 @@ class XTrimOrchestrator:
 
         lat_agg = self._latency_aggregate(latency_ms)
         extra["latency_agg_ms"] = float(lat_agg)
-        extra["scalar_score"] = self._scalarize(acc, lat_agg, size_bytes)
+        extra["scalar_score"] = self._scalarize(deploy_acc, lat_agg, size_bytes)
         extra["latency_aggregate_mode"] = self.latency_cfg.aggregate
 
-        metrics = Metrics(acc=float(acc), size_bytes=int(size_bytes), latency_ms=latency_ms)
+        metrics = Metrics(acc=float(deploy_acc), size_bytes=int(size_bytes), latency_ms=latency_ms)
         return HistoryItem(candidate=cand, metrics=metrics, artifacts_dir=str(run_dir), extra=extra)
 
     def _archive_history(self) -> None:

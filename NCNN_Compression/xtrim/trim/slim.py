@@ -55,7 +55,12 @@ def _looks_like_c2f_like_parent(m: Any) -> bool:
 def _is_original_c2f_like_parent(m: Any) -> bool:
     return _looks_like_c2f_like_parent(m) and not _is_xtrim_prunable_c2f_like(m)
 
-PSA_FAMILY_CLASSNAMES = {"Attention", "PSABlock", "PSA", "C2PSA", "C2fPSA"}
+PSA_FAMILY_CLASSNAMES = {
+    "Attention", "PSABlock", "PSA", "C2PSA", "C2fPSA",
+    # xtrim pruning adapters. These classes preserve PSA/C2PSA split/chunk
+    # invariants and must be handled atomically, not by generic Conv pruning.
+    "PSABlockPrunable", "PSAPrunable", "C2PSAPrunable", "C2fPSAPrunable",
+}
 DETECT_FAMILY_CLASSNAMES = {"Detect"}
 
 

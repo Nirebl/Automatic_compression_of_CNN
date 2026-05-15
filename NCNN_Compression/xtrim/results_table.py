@@ -198,7 +198,7 @@ def print_results_table(
         print("  ".join(row_parts))
 
     print(sep)
-    print("  * = Pareto-optimal  |  Δ mAP vs raw reference baseline  |  Δ INT8 = PTQ - FP32  |  Compr× = baseline_size / candidate_size")
+    print("  * = Pareto-optimal  |  mAP/Δ mAP = selected deploy artifact vs raw reference baseline  |  Δ INT8 = PTQ - FP32  |  Compr× = baseline_size / candidate_size")
 
     if failed_history:
         print(f"\n  {'FAILED CANDIDATES':}")
