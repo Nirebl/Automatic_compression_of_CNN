@@ -35,6 +35,31 @@ class AndroidOrtBench:
             pass
         return rmodel
 
+    def push_dataset_subset(
+        self,
+        device: DeviceConfig,
+        *,
+        local_images_dir: Path,
+        local_image_list: Path,
+        remote_images_dir: str,
+        remote_image_list: str,
+    ) -> tuple[str, str]:
+        self.adb(device.serial, "shell", "rm", "-rf", remote_images_dir)
+        self.adb(device.serial, "shell", "mkdir", "-p", remote_images_dir)
+
+        for image_path in sorted(Path(local_images_dir).iterdir()):
+            if image_path.is_file():
+                self.adb(device.serial, "push", str(image_path), f"{remote_images_dir}/{image_path.name}")
+
+        self.adb(device.serial, "push", str(local_image_list), remote_image_list)
+        try:
+            # Directory must stay executable/traversable for the Android app.
+            # chmod -R 644 would make the directory unreadable as a directory.
+            self.adb(device.serial, "shell", f"chmod 755 {remote_images_dir} && chmod 644 {remote_images_dir}/*")
+        except Exception:
+            pass
+        return remote_images_dir, remote_image_list
+
     def force_stop(self, device: DeviceConfig) -> None:
         try:
             self.adb(device.serial, "shell", "am", "force-stop", self.cfg.package)
@@ -61,7 +86,17 @@ class AndroidOrtBench:
                 found.append(obj)
         return found[-1] if found else None
 
-    def run_once(self, *, device: DeviceConfig, local_onnx: Path) -> dict:
+    def run_once(
+        self,
+        *,
+        device: DeviceConfig,
+        local_onnx: Path,
+        local_images_dir: Optional[Path] = None,
+        local_image_list: Optional[Path] = None,
+        remote_images_dir: Optional[str] = None,
+        remote_image_list: Optional[str] = None,
+        dataset_image_count: int = 0,
+    ) -> dict:
         cfg = self.cfg
         if not cfg.enabled:
             raise RuntimeError("OrtAndroidBenchConfig.enabled=False")
@@ -76,6 +111,24 @@ class AndroidOrtBench:
             time.sleep(float(device.cooling_down))
 
         rmodel = self.push_model(device, local_onnx)
+
+        pushed_image_args: List[str] = []
+        if cfg.push_dataset_images:
+            if not (local_images_dir and local_image_list and remote_images_dir and remote_image_list):
+                raise RuntimeError("push_dataset_images=True, but dataset subset paths were not provided")
+            rimages, rlist = self.push_dataset_subset(
+                device,
+                local_images_dir=local_images_dir,
+                local_image_list=local_image_list,
+                remote_images_dir=remote_images_dir,
+                remote_image_list=remote_image_list,
+            )
+            pushed_image_args = [
+                "--ez", "use_pushed_images", "true",
+                "--es", "image_dir", rimages,
+                "--es", "image_list", rlist,
+                "--ei", "image_count", str(int(dataset_image_count)),
+            ]
 
         if cfg.clear_logcat:
             self.clear_logcat(device)
@@ -93,6 +146,7 @@ class AndroidOrtBench:
             "--ei", "warmup", str(int(cfg.warmup)),
             "--ei", "threads", str(int(cfg.threads)),
             "--ei", "max_det", str(int(cfg.max_det)),
+            *pushed_image_args,
             "--ef", "conf", str(float(cfg.conf)),
             "--ef", "iou", str(float(cfg.iou)),
         ]

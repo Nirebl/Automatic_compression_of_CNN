@@ -298,6 +298,14 @@ class AndroidAppBenchConfig:
     package: str = "com.example.testyolo"
     activity: str = ".CliBenchActivity"
     dataset: str = "coco"
+    # If enabled, the orchestrator selects a deterministic subset of the dataset
+    # split, pushes the images to Android, and passes image_dir/image_list extras
+    # to the benchmark activity. The Android app must support these extras.
+    push_dataset_images: bool = False
+    dataset_split: str = "val"
+    dataset_max_images: int = 32
+    dataset_seed: int = 42
+    dataset_remote_subdir: str = "xtrim_bench_images"
     imgsz: int = 640
     loops: int = 50
     warmup: int = 10
@@ -318,6 +326,13 @@ class OrtAndroidBenchConfig:
     package: str = "com.example.testyolo"
     activity: str = ".CliBenchActivity"
     dataset: str = "coco"
+    # Same contract as AndroidAppBenchConfig: the Python side pushes a real
+    # image subset and the Android activity consumes image_dir/image_list extras.
+    push_dataset_images: bool = False
+    dataset_split: str = "val"
+    dataset_max_images: int = 32
+    dataset_seed: int = 42
+    dataset_remote_subdir: str = "xtrim_bench_images"
     imgsz: int = 640
     loops: int = 50
     warmup: int = 10

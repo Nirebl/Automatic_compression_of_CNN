@@ -33,6 +33,7 @@ from .types import (
 )
 from .android_app_bench import AndroidAppBench, AndroidAppBenchConfig
 from .android_ort_bench import AndroidOrtBench
+from .android_dataset import AndroidDatasetSubset, prepare_android_dataset_subset
 from .utils import ensure_dir, sizeof_file, write_json, now_ts, sha256_file
 
 
@@ -67,6 +68,7 @@ class XTrimOrchestrator:
         save_student_pt_fn: Optional[Callable[[Any, Path], None]] = None,
         android_app_bench_cfg: AndroidAppBenchConfig,
         ort_android_bench_cfg: OrtAndroidBenchConfig,
+        dataset_yaml: str = "coco128.yaml",
     ):
         self.out_root = out_root
         self.tools = tools
@@ -103,6 +105,7 @@ class XTrimOrchestrator:
         self.android_app = AndroidAppBench(tools, android_app_bench_cfg)
         self.ort_android_bench_cfg = ort_android_bench_cfg
         self.android_ort = AndroidOrtBench(tools, ort_android_bench_cfg)
+        self.dataset_yaml = str(dataset_yaml)
 
         ensure_dir(self.out_root)
         self.history_path = self.out_root / "history.jsonl"
@@ -349,6 +352,41 @@ class XTrimOrchestrator:
             extra=extra,
         )
 
+    def _prepare_android_dataset_subset(
+        self,
+        *,
+        run_dir: Path,
+        backend_name: str,
+        split: str,
+        max_images: int,
+        seed: int,
+        remote_dir: str,
+        remote_subdir: str,
+    ) -> AndroidDatasetSubset:
+        out_dir = run_dir / f"{backend_name}_dataset"
+        return prepare_android_dataset_subset(
+            data_yaml=self.dataset_yaml,
+            split=split,
+            max_images=int(max_images),
+            seed=int(seed),
+            out_dir=out_dir,
+            remote_dir=remote_dir,
+            remote_subdir=remote_subdir,
+        )
+
+    @staticmethod
+    def _android_dataset_cache_suffix(
+        *,
+        enabled: bool,
+        data_yaml: str,
+        split: str,
+        max_images: int,
+        seed: int,
+    ) -> str:
+        if not enabled:
+            return "dataset=synthetic_or_app_default"
+        return f"dataset={data_yaml}|split={split}|n={int(max_images)}|seed={int(seed)}"
+
     def _bench_devices_with_android_ort(self, onnx_model: Path, run_dir: Path) -> Dict[str, float]:
         latency_ms: Dict[str, float] = {}
         if not self.devices:
@@ -356,6 +394,30 @@ class XTrimOrchestrator:
 
         logs_dir = run_dir / "android_ort_logs"
         ensure_dir(logs_dir)
+
+        dataset_subset: Optional[AndroidDatasetSubset] = None
+        if self.ort_android_bench_cfg.push_dataset_images:
+            dataset_subset = self._prepare_android_dataset_subset(
+                run_dir=run_dir,
+                backend_name="android_ort",
+                split=self.ort_android_bench_cfg.dataset_split,
+                max_images=self.ort_android_bench_cfg.dataset_max_images,
+                seed=self.ort_android_bench_cfg.dataset_seed,
+                remote_dir=self.ort_android_bench_cfg.remote_dir,
+                remote_subdir=self.ort_android_bench_cfg.dataset_remote_subdir,
+            )
+            (logs_dir / "dataset_subset.json").write_text(
+                json.dumps(dataclasses.asdict(dataset_subset), ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+        dataset_key = self._android_dataset_cache_suffix(
+            enabled=bool(self.ort_android_bench_cfg.push_dataset_images),
+            data_yaml=self.dataset_yaml,
+            split=self.ort_android_bench_cfg.dataset_split,
+            max_images=self.ort_android_bench_cfg.dataset_max_images,
+            seed=self.ort_android_bench_cfg.dataset_seed,
+        )
 
         for d in self.devices:
             model_hash = self._hash_file_model(onnx_model)
@@ -365,6 +427,7 @@ class XTrimOrchestrator:
                 f"threads={d.threads}",
                 f"imgsz={self.ort_android_bench_cfg.imgsz}",
                 f"provider={self.ort_android_bench_cfg.provider}",
+                dataset_key,
                 f"model={model_hash}",
             ])
 
@@ -378,7 +441,17 @@ class XTrimOrchestrator:
                     )
                     continue
 
-            data = self.android_ort.run_once(device=d, local_onnx=onnx_model)
+            run_kwargs = {}
+            if dataset_subset is not None:
+                run_kwargs = dict(
+                    local_images_dir=dataset_subset.local_dir,
+                    local_image_list=dataset_subset.local_list,
+                    remote_images_dir=dataset_subset.remote_dir,
+                    remote_image_list=dataset_subset.remote_list,
+                    dataset_image_count=dataset_subset.count,
+                )
+
+            data = self.android_ort.run_once(device=d, local_onnx=onnx_model, **run_kwargs)
 
             avg_ms = None
             for k in ("avg_ms", "latency_ms", "mean_ms"):
@@ -425,9 +498,37 @@ class XTrimOrchestrator:
         logs_dir = run_dir / "android_app_logs"
         ensure_dir(logs_dir)
 
+        dataset_subset: Optional[AndroidDatasetSubset] = None
+        if self.android_app_bench_cfg.push_dataset_images:
+            dataset_subset = self._prepare_android_dataset_subset(
+                run_dir=run_dir,
+                backend_name="android_app",
+                split=self.android_app_bench_cfg.dataset_split,
+                max_images=self.android_app_bench_cfg.dataset_max_images,
+                seed=self.android_app_bench_cfg.dataset_seed,
+                remote_dir=self.android_app_bench_cfg.remote_dir,
+                remote_subdir=self.android_app_bench_cfg.dataset_remote_subdir,
+            )
+            (logs_dir / "dataset_subset.json").write_text(
+                json.dumps(dataclasses.asdict(dataset_subset), ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+        dataset_key = self._android_dataset_cache_suffix(
+            enabled=bool(self.android_app_bench_cfg.push_dataset_images),
+            data_yaml=self.dataset_yaml,
+            split=self.android_app_bench_cfg.dataset_split,
+            max_images=self.android_app_bench_cfg.dataset_max_images,
+            seed=self.android_app_bench_cfg.dataset_seed,
+        )
+
         for d in self.devices:
             model_hash = self._hash_ncnn_model(ncnn_param, ncnn_bin)
-            key = self._cache_key(d, model_hash, shape=f"android_app_imgsz={self.android_app_bench_cfg.imgsz}")
+            key = self._cache_key(
+                d,
+                model_hash,
+                shape=f"android_app_imgsz={self.android_app_bench_cfg.imgsz}|{dataset_key}",
+            )
 
             if self.latency_cfg.use_cache and (not self.latency_cfg.force_rebench):
                 hit = self.cache.get(key)
@@ -439,7 +540,17 @@ class XTrimOrchestrator:
                     )
                     continue
 
-            data = self.android_app.run_once(device=d, local_param=ncnn_param, local_bin=ncnn_bin)
+            run_kwargs = {}
+            if dataset_subset is not None:
+                run_kwargs = dict(
+                    local_images_dir=dataset_subset.local_dir,
+                    local_image_list=dataset_subset.local_list,
+                    remote_images_dir=dataset_subset.remote_dir,
+                    remote_image_list=dataset_subset.remote_list,
+                    dataset_image_count=dataset_subset.count,
+                )
+
+            data = self.android_app.run_once(device=d, local_param=ncnn_param, local_bin=ncnn_bin, **run_kwargs)
 
             (logs_dir / f"{d.name}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 

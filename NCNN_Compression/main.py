@@ -181,6 +181,7 @@ def main() -> int:
         save_student_pt_fn=save_student_torchscript,
         android_app_bench_cfg=android_app_bench_cfg,
         ort_android_bench_cfg=ort_android_bench_cfg,
+        dataset_yaml=model_cfg.data,
     )
 
     history = orch.run(max_candidates=args.max_candidates)
