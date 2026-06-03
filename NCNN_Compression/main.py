@@ -20,6 +20,8 @@ from xtrim.yolo.ultralytics_io import (
     finetune_noop,
     finetune_kd,
     finetune_qat_recover,
+    apply_ultralytics_pruning_stage,
+    extract_ultralytics_pruning_architecture,
 )
 
 
@@ -64,6 +66,7 @@ def main() -> int:
         lut_cfg,
         gumbel_cfg,
         lowrank_cfg,
+        staged_pruning_cfg,
         dilated_cfg,
     ) = parse_config(cfg)
 
@@ -77,6 +80,24 @@ def main() -> int:
             dilated_cfg=dilated_cfg,
         )
 
+    def apply_pruning_stage_fn(
+        student,
+        stage_prune_ratio: float,
+        stage_label: str,
+        target_architecture=None,
+    ):
+        return apply_ultralytics_pruning_stage(
+            student,
+            stage_prune_ratio=stage_prune_ratio,
+            model_cfg=model_cfg,
+            trim_cfg=trim_cfg,
+            stage_label=stage_label,
+            target_architecture=target_architecture,
+        )
+
+    def extract_pruning_architecture_fn(student):
+        return extract_ultralytics_pruning_architecture(student, trim_cfg)
+
     def export_factory(student, export_cfg_):
         return make_ultralytics_export_onnx_fn(student, model_cfg, export_cfg_)
 
@@ -87,17 +108,17 @@ def main() -> int:
         return eval_exported_onnx_map(onnx_path, model_cfg, eval_cfg)
 
     if bool(train_cfg.kd_enabled) and bool(kd_cfg.enabled):
-        def finetune_fn(student, _train_cfg):
+        def finetune_fn(student, stage_train_cfg):
             return finetune_kd(
-                student, train_cfg, model_cfg, trim_cfg, kd_cfg,
+                student, stage_train_cfg, model_cfg, trim_cfg, kd_cfg,
                 lut_cfg=lut_cfg, gumbel_cfg=gumbel_cfg,
             )
     else:
         finetune_fn = finetune_noop
 
     if bool(qat_cfg.enabled) and bool(kd_cfg.enabled):
-        def finetune_qat_fn(student, _train_cfg):
-            return finetune_qat_recover(student, train_cfg, model_cfg, trim_cfg, kd_cfg, qat_cfg)
+        def finetune_qat_fn(student, stage_train_cfg):
+            return finetune_qat_recover(student, stage_train_cfg, model_cfg, trim_cfg, kd_cfg, qat_cfg)
     else:
         finetune_qat_fn = None
 
@@ -145,7 +166,11 @@ def main() -> int:
         android_demo_cfg=android_demo_cfg,
         search_cfg=search_cfg,
         search_space=search_space,
+        trim_cfg=trim_cfg,
+        staged_pruning_cfg=staged_pruning_cfg,
         build_candidate_fn=build_fn,
+        apply_pruning_stage_fn=apply_pruning_stage_fn,
+        extract_pruning_architecture_fn=extract_pruning_architecture_fn,
         warmstart_fn=warmstart_noop,
         finetune_fn=finetune_fn,
         finetune_qat_fn=finetune_qat_fn,
@@ -156,6 +181,7 @@ def main() -> int:
         save_student_pt_fn=save_student_torchscript,
         android_app_bench_cfg=android_app_bench_cfg,
         ort_android_bench_cfg=ort_android_bench_cfg,
+        dataset_yaml=model_cfg.data,
     )
 
     history = orch.run(max_candidates=args.max_candidates)

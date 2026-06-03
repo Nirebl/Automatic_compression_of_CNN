@@ -27,10 +27,13 @@ from .types import (
     QATConfig,
     AndroidDemoConfig,
     SearchConfig,
+    TrimConfig,
+    StagedPruningConfig,
     OrtAndroidBenchConfig,
 )
 from .android_app_bench import AndroidAppBench, AndroidAppBenchConfig
 from .android_ort_bench import AndroidOrtBench
+from .android_dataset import AndroidDatasetSubset, prepare_android_dataset_subset
 from .utils import ensure_dir, sizeof_file, write_json, now_ts, sha256_file
 
 
@@ -50,7 +53,11 @@ class XTrimOrchestrator:
         android_demo_cfg: AndroidDemoConfig,
         search_cfg: SearchConfig,
         search_space: Dict[str, List[Any]],
+        trim_cfg: Optional[TrimConfig] = None,
+        staged_pruning_cfg: Optional[StagedPruningConfig] = None,
         build_candidate_fn: Callable[[CandidateConfig], Any],
+        apply_pruning_stage_fn: Optional[Callable[..., Dict[str, Any]]] = None,
+        extract_pruning_architecture_fn: Optional[Callable[[Any], Dict[str, Any]]] = None,
         warmstart_fn: Callable[[Any], None],
         finetune_fn: Callable[[Any, TrainConfig], Any],
         finetune_qat_fn: Optional[Callable[[Any, TrainConfig], Any]] = None,
@@ -61,6 +68,7 @@ class XTrimOrchestrator:
         save_student_pt_fn: Optional[Callable[[Any, Path], None]] = None,
         android_app_bench_cfg: AndroidAppBenchConfig,
         ort_android_bench_cfg: OrtAndroidBenchConfig,
+        dataset_yaml: str = "coco128.yaml",
     ):
         self.out_root = out_root
         self.tools = tools
@@ -74,8 +82,12 @@ class XTrimOrchestrator:
         self.android_demo_cfg = android_demo_cfg
         self.search_cfg = search_cfg
         self.search_space = search_space
+        self.trim_cfg = trim_cfg or TrimConfig()
+        self.staged_pruning_cfg = staged_pruning_cfg or StagedPruningConfig()
 
         self.build_candidate_fn = build_candidate_fn
+        self.apply_pruning_stage_fn = apply_pruning_stage_fn
+        self.extract_pruning_architecture_fn = extract_pruning_architecture_fn
         self.warmstart_fn = warmstart_fn
         self.finetune_fn = finetune_fn
         self.finetune_qat_fn = finetune_qat_fn
@@ -93,6 +105,7 @@ class XTrimOrchestrator:
         self.android_app = AndroidAppBench(tools, android_app_bench_cfg)
         self.ort_android_bench_cfg = ort_android_bench_cfg
         self.android_ort = AndroidOrtBench(tools, ort_android_bench_cfg)
+        self.dataset_yaml = str(dataset_yaml)
 
         ensure_dir(self.out_root)
         self.history_path = self.out_root / "history.jsonl"
@@ -339,6 +352,41 @@ class XTrimOrchestrator:
             extra=extra,
         )
 
+    def _prepare_android_dataset_subset(
+        self,
+        *,
+        run_dir: Path,
+        backend_name: str,
+        split: str,
+        max_images: int,
+        seed: int,
+        remote_dir: str,
+        remote_subdir: str,
+    ) -> AndroidDatasetSubset:
+        out_dir = run_dir / f"{backend_name}_dataset"
+        return prepare_android_dataset_subset(
+            data_yaml=self.dataset_yaml,
+            split=split,
+            max_images=int(max_images),
+            seed=int(seed),
+            out_dir=out_dir,
+            remote_dir=remote_dir,
+            remote_subdir=remote_subdir,
+        )
+
+    @staticmethod
+    def _android_dataset_cache_suffix(
+        *,
+        enabled: bool,
+        data_yaml: str,
+        split: str,
+        max_images: int,
+        seed: int,
+    ) -> str:
+        if not enabled:
+            return "dataset=synthetic_or_app_default"
+        return f"dataset={data_yaml}|split={split}|n={int(max_images)}|seed={int(seed)}"
+
     def _bench_devices_with_android_ort(self, onnx_model: Path, run_dir: Path) -> Dict[str, float]:
         latency_ms: Dict[str, float] = {}
         if not self.devices:
@@ -346,6 +394,30 @@ class XTrimOrchestrator:
 
         logs_dir = run_dir / "android_ort_logs"
         ensure_dir(logs_dir)
+
+        dataset_subset: Optional[AndroidDatasetSubset] = None
+        if self.ort_android_bench_cfg.push_dataset_images:
+            dataset_subset = self._prepare_android_dataset_subset(
+                run_dir=run_dir,
+                backend_name="android_ort",
+                split=self.ort_android_bench_cfg.dataset_split,
+                max_images=self.ort_android_bench_cfg.dataset_max_images,
+                seed=self.ort_android_bench_cfg.dataset_seed,
+                remote_dir=self.ort_android_bench_cfg.remote_dir,
+                remote_subdir=self.ort_android_bench_cfg.dataset_remote_subdir,
+            )
+            (logs_dir / "dataset_subset.json").write_text(
+                json.dumps(dataclasses.asdict(dataset_subset), ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+        dataset_key = self._android_dataset_cache_suffix(
+            enabled=bool(self.ort_android_bench_cfg.push_dataset_images),
+            data_yaml=self.dataset_yaml,
+            split=self.ort_android_bench_cfg.dataset_split,
+            max_images=self.ort_android_bench_cfg.dataset_max_images,
+            seed=self.ort_android_bench_cfg.dataset_seed,
+        )
 
         for d in self.devices:
             model_hash = self._hash_file_model(onnx_model)
@@ -355,6 +427,7 @@ class XTrimOrchestrator:
                 f"threads={d.threads}",
                 f"imgsz={self.ort_android_bench_cfg.imgsz}",
                 f"provider={self.ort_android_bench_cfg.provider}",
+                dataset_key,
                 f"model={model_hash}",
             ])
 
@@ -368,7 +441,17 @@ class XTrimOrchestrator:
                     )
                     continue
 
-            data = self.android_ort.run_once(device=d, local_onnx=onnx_model)
+            run_kwargs = {}
+            if dataset_subset is not None:
+                run_kwargs = dict(
+                    local_images_dir=dataset_subset.local_dir,
+                    local_image_list=dataset_subset.local_list,
+                    remote_images_dir=dataset_subset.remote_dir,
+                    remote_image_list=dataset_subset.remote_list,
+                    dataset_image_count=dataset_subset.count,
+                )
+
+            data = self.android_ort.run_once(device=d, local_onnx=onnx_model, **run_kwargs)
 
             avg_ms = None
             for k in ("avg_ms", "latency_ms", "mean_ms"):
@@ -415,9 +498,37 @@ class XTrimOrchestrator:
         logs_dir = run_dir / "android_app_logs"
         ensure_dir(logs_dir)
 
+        dataset_subset: Optional[AndroidDatasetSubset] = None
+        if self.android_app_bench_cfg.push_dataset_images:
+            dataset_subset = self._prepare_android_dataset_subset(
+                run_dir=run_dir,
+                backend_name="android_app",
+                split=self.android_app_bench_cfg.dataset_split,
+                max_images=self.android_app_bench_cfg.dataset_max_images,
+                seed=self.android_app_bench_cfg.dataset_seed,
+                remote_dir=self.android_app_bench_cfg.remote_dir,
+                remote_subdir=self.android_app_bench_cfg.dataset_remote_subdir,
+            )
+            (logs_dir / "dataset_subset.json").write_text(
+                json.dumps(dataclasses.asdict(dataset_subset), ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+        dataset_key = self._android_dataset_cache_suffix(
+            enabled=bool(self.android_app_bench_cfg.push_dataset_images),
+            data_yaml=self.dataset_yaml,
+            split=self.android_app_bench_cfg.dataset_split,
+            max_images=self.android_app_bench_cfg.dataset_max_images,
+            seed=self.android_app_bench_cfg.dataset_seed,
+        )
+
         for d in self.devices:
             model_hash = self._hash_ncnn_model(ncnn_param, ncnn_bin)
-            key = self._cache_key(d, model_hash, shape=f"android_app_imgsz={self.android_app_bench_cfg.imgsz}")
+            key = self._cache_key(
+                d,
+                model_hash,
+                shape=f"android_app_imgsz={self.android_app_bench_cfg.imgsz}|{dataset_key}",
+            )
 
             if self.latency_cfg.use_cache and (not self.latency_cfg.force_rebench):
                 hit = self.cache.get(key)
@@ -429,7 +540,17 @@ class XTrimOrchestrator:
                     )
                     continue
 
-            data = self.android_app.run_once(device=d, local_param=ncnn_param, local_bin=ncnn_bin)
+            run_kwargs = {}
+            if dataset_subset is not None:
+                run_kwargs = dict(
+                    local_images_dir=dataset_subset.local_dir,
+                    local_image_list=dataset_subset.local_list,
+                    remote_images_dir=dataset_subset.remote_dir,
+                    remote_image_list=dataset_subset.remote_list,
+                    dataset_image_count=dataset_subset.count,
+                )
+
+            data = self.android_app.run_once(device=d, local_param=ncnn_param, local_bin=ncnn_bin, **run_kwargs)
 
             (logs_dir / f"{d.name}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -520,12 +641,66 @@ class XTrimOrchestrator:
                 extra[f"acc_onnx_int8_{tag}_skipped"] = str(e)
         return p
 
+    def _prune_mode(self) -> str:
+        mode = str(getattr(self.trim_cfg, "prune_mode", "one_shot") or "one_shot").strip().lower()
+        if mode not in {"one_shot", "staged"}:
+            raise ValueError(f"Unsupported trim.prune_mode={mode!r}; expected 'one_shot' or 'staged'")
+        return mode
 
-    def _process_candidate(self, cand: CandidateConfig, run_dir: Path) -> HistoryItem:
-        student = self.build_candidate_fn(cand)
-        self.warmstart_fn(student)
+    @staticmethod
+    def _local_prune_ratio(prev_total: float, target_total: float) -> float:
+        """Convert cumulative pruning targets into a local ratio for the current model."""
+        prev = float(prev_total)
+        target = float(target_total)
+        if not (0.0 <= prev < 1.0):
+            raise ValueError(f"prev_total must be in [0, 1), got {prev_total}")
+        if not (prev < target < 1.0):
+            raise ValueError(f"target_total must be in ({prev}, 1), got {target_total}")
+        return float(1.0 - ((1.0 - target) / (1.0 - prev)))
 
-        extra: Dict[str, Any] = {}
+    def _build_pruning_plan(self, final_target: float) -> List[Dict[str, float]]:
+        target = float(final_target)
+        if target <= 0.0:
+            return []
+        if target >= 1.0:
+            raise ValueError(f"candidate prune_ratio must be < 1.0, got {target}")
+
+        if self._prune_mode() == "one_shot":
+            targets = [target]
+        else:
+            raw = [float(v) for v in getattr(self.staged_pruning_cfg, "milestones", ())]
+            if any(not (0.0 < v < 1.0) for v in raw):
+                raise ValueError(f"staged_pruning.milestones must be in (0, 1), got {raw}")
+            targets = sorted({v for v in raw if v < target})
+            targets.append(target)
+
+        plan: List[Dict[str, float]] = []
+        prev = 0.0
+        for stage_idx, stage_target in enumerate(targets, 1):
+            local = self._local_prune_ratio(prev, stage_target)
+            plan.append(
+                {
+                    "stage_index": int(stage_idx),
+                    "previous_total": float(prev),
+                    "target_total": float(stage_target),
+                    "local_ratio": float(local),
+                }
+            )
+            prev = stage_target
+        return plan
+
+    def _stage_train_cfg(self, *, is_final: bool) -> TrainConfig:
+        cfg = self.staged_pruning_cfg
+        if is_final:
+            epochs = self.train_cfg.short_epochs if cfg.final_epochs is None else int(cfg.final_epochs)
+            lr = self.train_cfg.lr if cfg.final_lr is None else float(cfg.final_lr)
+        else:
+            epochs = int(cfg.intermediate_epochs)
+            lr = self.train_cfg.lr if cfg.intermediate_lr is None else float(cfg.intermediate_lr)
+        return dataclasses.replace(self.train_cfg, short_epochs=int(epochs), lr=float(lr))
+
+    @staticmethod
+    def _collect_student_transform_stats(student: Any, extra: Dict[str, Any]) -> None:
         try:
             if hasattr(student, "yolo") and hasattr(student.yolo, "_xtrim_trim_stats"):
                 extra["trim_stats"] = getattr(student.yolo, "_xtrim_trim_stats")
@@ -533,13 +708,245 @@ class XTrimOrchestrator:
                 extra["all_transform_stats"] = getattr(student.yolo, "_xtrim_all_stats")
         except Exception as e:
             print(e)
-            pass
 
-        finetune_logs = self.finetune_fn(student, self.train_cfg)
-        if isinstance(finetune_logs, dict):
-            extra["finetune_logs"] = finetune_logs
+    def _staged_target_mode(self) -> str:
+        mode = str(getattr(self.staged_pruning_cfg, "target_mode", "ratio_schedule") or "ratio_schedule").strip().lower()
+        if mode not in {"ratio_schedule", "match_one_shot_architecture"}:
+            raise ValueError(
+                f"Unsupported staged_pruning.target_mode={mode!r}; expected "
+                "'ratio_schedule' or 'match_one_shot_architecture'"
+            )
+        return mode
 
-        acc = float(self.eval_acc_fn(student))
+    @staticmethod
+    def _interpolate_width_map(
+        current: Dict[str, Any],
+        final: Dict[str, Any],
+        progress: float,
+    ) -> Dict[str, int]:
+        """Move current widths toward final widths without undershooting the final target."""
+        p = max(0.0, min(1.0, float(progress)))
+        out: Dict[str, int] = {}
+        for name, final_width in dict(final or {}).items():
+            cur = int(dict(current or {}).get(name, final_width))
+            fin = int(final_width)
+            if cur <= fin:
+                out[str(name)] = cur
+                continue
+            keep = int(fin + math.ceil(((cur - fin) * (1.0 - p)) - 1e-9))
+            out[str(name)] = max(fin, min(cur, keep))
+        return out
+
+    def _interpolate_architecture(
+        self,
+        current_arch: Dict[str, Any],
+        final_arch: Dict[str, Any],
+        progress: float,
+    ) -> Dict[str, Any]:
+        return {
+            "conv_out_channels": self._interpolate_width_map(
+                dict(current_arch.get("conv_out_channels", {}) or {}),
+                dict(final_arch.get("conv_out_channels", {}) or {}),
+                progress,
+            ),
+            "detect_hidden_channels": self._interpolate_width_map(
+                dict(current_arch.get("detect_hidden_channels", {}) or {}),
+                dict(final_arch.get("detect_hidden_channels", {}) or {}),
+                progress,
+            ),
+            # During intermediate stages this is a width target, not an exact param target.
+            "total_params": int(final_arch.get("total_params", 0) or 0),
+        }
+
+    @staticmethod
+    def _architecture_mismatch_summary(
+        actual_arch: Dict[str, Any],
+        target_arch: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        def _diff(actual: Dict[str, Any], target: Dict[str, Any]) -> Dict[str, Dict[str, int]]:
+            return {
+                str(k): {"target": int(v), "actual": int(actual.get(k, -1))}
+                for k, v in dict(target or {}).items()
+                if int(actual.get(k, -1)) != int(v)
+            }
+
+        conv = _diff(
+            dict(actual_arch.get("conv_out_channels", {}) or {}),
+            dict(target_arch.get("conv_out_channels", {}) or {}),
+        )
+        detect = _diff(
+            dict(actual_arch.get("detect_hidden_channels", {}) or {}),
+            dict(target_arch.get("detect_hidden_channels", {}) or {}),
+        )
+        return {
+            "conv_mismatch_count": int(len(conv)),
+            "detect_mismatch_count": int(len(detect)),
+            "conv_mismatches": conv,
+            "detect_mismatches": detect,
+            "actual_total_params": int(actual_arch.get("total_params", 0) or 0),
+            "target_total_params": int(target_arch.get("total_params", 0) or 0),
+        }
+
+    def _build_one_shot_target_architecture(self, cand: CandidateConfig) -> Dict[str, Any]:
+        if self.extract_pruning_architecture_fn is None:
+            raise RuntimeError(
+                "staged_pruning.target_mode='match_one_shot_architecture' requires "
+                "extract_pruning_architecture_fn"
+            )
+        shadow = self.build_candidate_fn(cand)
+        try:
+            return dict(self.extract_pruning_architecture_fn(shadow) or {})
+        finally:
+            try:
+                del shadow
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+    def _build_and_recover_student(
+        self,
+        cand: CandidateConfig,
+        extra: Dict[str, Any],
+    ) -> tuple[Any, Optional[float]]:
+        mode = self._prune_mode()
+        if mode != "staged" or float(cand.prune_ratio) <= 0.0:
+            student = self.build_candidate_fn(cand)
+            self.warmstart_fn(student)
+            self._collect_student_transform_stats(student, extra)
+
+            finetune_logs = self.finetune_fn(student, self.train_cfg)
+            if isinstance(finetune_logs, dict):
+                extra["finetune_logs"] = finetune_logs
+            extra["pruning_mode"] = "one_shot"
+            return student, None
+
+        if self.apply_pruning_stage_fn is None:
+            raise RuntimeError("trim.prune_mode='staged' requires apply_pruning_stage_fn")
+
+        plan = self._build_pruning_plan(float(cand.prune_ratio))
+        if not plan:
+            raise RuntimeError("staged pruning requested, but no pruning plan was built")
+
+        target_mode = self._staged_target_mode()
+        one_shot_target_arch: Optional[Dict[str, Any]] = None
+        if target_mode == "match_one_shot_architecture":
+            one_shot_target_arch = self._build_one_shot_target_architecture(cand)
+
+        first = plan[0]
+        first_cand = dataclasses.replace(cand, prune_ratio=float(first["local_ratio"]))
+        student = self.build_candidate_fn(first_cand)
+        self.warmstart_fn(student)
+
+        stages: List[Dict[str, Any]] = []
+        final_acc: Optional[float] = None
+        eval_each_stage = bool(getattr(self.staged_pruning_cfg, "eval_after_each_stage", True))
+        final_target_total = float(plan[-1]["target_total"])
+
+        for i, stage in enumerate(plan):
+            is_final = i == len(plan) - 1
+            stage_label = f"staged_{i + 1}"
+            stage_target_arch: Optional[Dict[str, Any]] = None
+            target_progress: Optional[float] = None
+
+            if i == 0:
+                stage_trim_stats = getattr(getattr(student, "yolo", None), "_xtrim_trim_stats", None)
+            else:
+                if target_mode == "match_one_shot_architecture":
+                    if self.extract_pruning_architecture_fn is None or one_shot_target_arch is None:
+                        raise RuntimeError("missing target architecture callback/state")
+                    current_arch = dict(self.extract_pruning_architecture_fn(student) or {})
+                    denom = max(1e-12, final_target_total - float(stage["previous_total"]))
+                    target_progress = min(
+                        1.0,
+                        max(0.0, (float(stage["target_total"]) - float(stage["previous_total"])) / denom),
+                    )
+                    stage_target_arch = self._interpolate_architecture(
+                        current_arch,
+                        one_shot_target_arch,
+                        target_progress,
+                    )
+                if stage_target_arch is None:
+                    stage_trim_stats = self.apply_pruning_stage_fn(
+                        student,
+                        float(stage["local_ratio"]),
+                        stage_label,
+                    )
+                else:
+                    stage_trim_stats = self.apply_pruning_stage_fn(
+                        student,
+                        float(stage["local_ratio"]),
+                        stage_label,
+                        target_architecture=stage_target_arch,
+                    )
+
+            stage_acc_before: Optional[float] = None
+            if eval_each_stage:
+                stage_acc_before = float(self.eval_acc_fn(student))
+
+            stage_train_cfg = self._stage_train_cfg(is_final=is_final)
+            stage_logs = self.finetune_fn(student, stage_train_cfg)
+
+            stage_rec: Dict[str, Any] = {
+                **stage,
+                "stage_label": stage_label,
+                "is_final": bool(is_final),
+                "train_epochs": int(stage_train_cfg.short_epochs),
+                "train_lr": float(stage_train_cfg.lr),
+            }
+            if target_progress is not None:
+                stage_rec["target_progress_to_one_shot"] = float(target_progress)
+            if stage_target_arch is not None:
+                stage_rec["target_architecture"] = stage_target_arch
+            if stage_acc_before is not None:
+                stage_rec["acc_before_recovery"] = stage_acc_before
+            if stage_trim_stats is not None:
+                stage_rec["trim_stats"] = stage_trim_stats
+            if isinstance(stage_logs, dict):
+                stage_rec["finetune_logs"] = stage_logs
+
+            if eval_each_stage:
+                stage_acc = float(self.eval_acc_fn(student))
+                stage_rec["acc_after_recovery"] = stage_acc
+                if is_final:
+                    final_acc = stage_acc
+
+            stages.append(stage_rec)
+
+        self._collect_student_transform_stats(student, extra)
+        extra["pruning_mode"] = "staged"
+        staged_extra: Dict[str, Any] = {
+            "milestones": [float(v) for v in getattr(self.staged_pruning_cfg, "milestones", ())],
+            "target_mode": target_mode,
+            "plan": plan,
+            "stages": stages,
+        }
+        if one_shot_target_arch is not None:
+            staged_extra["one_shot_target_architecture"] = one_shot_target_arch
+            if self.extract_pruning_architecture_fn is not None:
+                achieved_arch = dict(self.extract_pruning_architecture_fn(student) or {})
+                staged_extra["final_architecture"] = achieved_arch
+                staged_extra["final_architecture_match"] = self._architecture_mismatch_summary(
+                    achieved_arch,
+                    one_shot_target_arch,
+                )
+        extra["staged_pruning"] = staged_extra
+        if stages and isinstance(stages[-1].get("finetune_logs"), dict):
+            extra["finetune_logs"] = stages[-1]["finetune_logs"]
+        return student, final_acc
+
+
+    def _process_candidate(self, cand: CandidateConfig, run_dir: Path) -> HistoryItem:
+        extra: Dict[str, Any] = {}
+        student, precomputed_acc = self._build_and_recover_student(cand, extra)
+
+        acc = float(precomputed_acc) if precomputed_acc is not None else float(self.eval_acc_fn(student))
         extra["acc_kind"] = "mAP50-95"
 
         try:
@@ -593,6 +1000,20 @@ class XTrimOrchestrator:
             if isinstance(qat_logs, dict):
                 extra["qat_logs"] = qat_logs
 
+            # finetune_qat_recover() normally disables fake-quant at the end,
+            # but keep this explicit here so the exported QAT model is always
+            # a clean deploy candidate with trained weights, not a graph with
+            # training-time fake-quant operators accidentally left enabled.
+            try:
+                from .quant.fake_quant_ultra import set_fake_quant_enabled
+
+                torch_model_qat = getattr(student, "torch_model", None)
+                if torch_model_qat is not None:
+                    set_fake_quant_enabled(torch_model_qat, False)
+                    extra["qat_fake_quant_disabled_before_export"] = True
+            except Exception as _fq_err:
+                extra["qat_fake_quant_disable_warning"] = str(_fq_err)
+
             onnx_qat = run_dir / "export" / "model_qat.onnx"
             exporter_qat = Exporter(self.export_onnx_fn_factory(student, self.export_cfg))
             exporter_qat.export_onnx(onnx_qat)
@@ -619,6 +1040,30 @@ class XTrimOrchestrator:
 
         extra["deploy_onnx_path"] = str(deploy_onnx)
         extra["deploy_onnx_kind"] = deploy_onnx_kind
+
+        # Metric used for Pareto/scalar/history must describe the same artifact
+        # that is measured for size and latency. Previously metrics.acc stayed
+        # at the pre-QAT FP32 recovery score, while size/latency could belong
+        # to model_int8_after_qat.onnx. That made FINAL RESULTS and Pareto
+        # compare different deploy artifacts.
+        deploy_acc = float(acc)
+        deploy_acc_source = "recovered_torch"
+        if deploy_onnx_kind == "int8_after_qat" and "acc_onnx_int8_after_qat" in extra:
+            deploy_acc = float(extra["acc_onnx_int8_after_qat"])
+            deploy_acc_source = "acc_onnx_int8_after_qat"
+        elif deploy_onnx_kind == "qat_fp32" and "acc_onnx_after_qat" in extra:
+            deploy_acc = float(extra["acc_onnx_after_qat"])
+            deploy_acc_source = "acc_onnx_after_qat"
+        elif deploy_onnx_kind == "int8_before_qat" and "acc_onnx_int8" in extra:
+            deploy_acc = float(extra["acc_onnx_int8"])
+            deploy_acc_source = "acc_onnx_int8"
+        elif deploy_onnx_kind == "fp32" and "acc_onnx" in extra:
+            deploy_acc = float(extra["acc_onnx"])
+            deploy_acc_source = "acc_onnx"
+
+        extra["acc_recovered_torch"] = float(acc)
+        extra["acc_deploy"] = float(deploy_acc)
+        extra["acc_deploy_source"] = deploy_acc_source
 
         size_bytes = int(sizeof_file(onnx_path))
         latency_ms: Dict[str, float] = {}
@@ -682,10 +1127,10 @@ class XTrimOrchestrator:
 
         lat_agg = self._latency_aggregate(latency_ms)
         extra["latency_agg_ms"] = float(lat_agg)
-        extra["scalar_score"] = self._scalarize(acc, lat_agg, size_bytes)
+        extra["scalar_score"] = self._scalarize(deploy_acc, lat_agg, size_bytes)
         extra["latency_aggregate_mode"] = self.latency_cfg.aggregate
 
-        metrics = Metrics(acc=float(acc), size_bytes=int(size_bytes), latency_ms=latency_ms)
+        metrics = Metrics(acc=float(deploy_acc), size_bytes=int(size_bytes), latency_ms=latency_ms)
         return HistoryItem(candidate=cand, metrics=metrics, artifacts_dir=str(run_dir), extra=extra)
 
     def _archive_history(self) -> None:

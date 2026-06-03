@@ -13,6 +13,7 @@ from .types import (
     PTQConfig,
     ModelConfig,
     TrimConfig,
+    StagedPruningConfig,
     LatencyConfig,
     EvalConfig,
     KDConfig,
@@ -57,6 +58,7 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     LatencyLUTConfig,
     GumbelChoiceConfig,
     LowRankConfig,
+    StagedPruningConfig,
     DilatedConfig,
 ]:
     tools = ToolsConfig(**cfg.get("tools", {}))
@@ -83,6 +85,11 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     lut_cfg = LatencyLUTConfig(**cfg.get("latency_lut", {}))
     gumbel_cfg = GumbelChoiceConfig(**cfg.get("gumbel_choice", {}))
     lowrank_cfg = LowRankConfig(**cfg.get("lowrank", {}))
+
+    staged_raw = dict(cfg.get("staged_pruning", {}) or {})
+    if "milestones" in staged_raw:
+        staged_raw["milestones"] = tuple(staged_raw["milestones"] or ())
+    staged_pruning_cfg = StagedPruningConfig(**staged_raw)
 
     ort_android_bench_cfg = OrtAndroidBenchConfig(**cfg.get("ort_android_bench", {}))
 
@@ -116,5 +123,6 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
         lut_cfg,
         gumbel_cfg,
         lowrank_cfg,
+        staged_pruning_cfg,
         dilated_cfg,
     )

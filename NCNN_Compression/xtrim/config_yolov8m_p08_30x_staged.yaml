@@ -16,7 +16,7 @@ trim:
   skip_cv1_if_parent_has_m: false
   include_inner_m_regex: null
   adapt_c2f_for_pruning: true
-  prune_mode: one_shot
+  prune_mode: staged
 latency:
   backend: ort_android
   use_cache: false
@@ -118,8 +118,11 @@ search_space:
   width_mult:
   - 1
   prune_ratio:
-  - 0.6
-  - 0.8
+    - 0.4
+    - 0.5
+    - 0.6
+    - 0.7
+    - 0.8
   lowrank_rank:
   - 0
   sparse_1x1:
@@ -208,12 +211,13 @@ ort_android_bench:
   clear_logcat: true
   remote_dir: /data/local/tmp
 staged_pruning:
+  target_mode: match_one_shot_architecture
   milestones:
   - 0.6
   - 0.7
   - 0.75
   intermediate_epochs: 30
   intermediate_lr: 0.0001
-  final_epochs: null
-  final_lr: null
+  final_epochs: 100
+  final_lr: 0.0002
   eval_after_each_stage: true
