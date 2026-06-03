@@ -28,7 +28,7 @@ android {
     }
 
     androidResources {
-        noCompress += listOf("param", "bin", "onnx")
+        noCompress += listOf("param", "bin", "onnx", "tflite")
     }
 
     buildFeatures {
@@ -80,4 +80,9 @@ dependencies {
 
     // ONNX Runtime Android
     implementation("com.microsoft.onnxruntime:onnxruntime-android:latest.release")
+
+    // TensorFlow Lite / LiteRT benchmark backends
+    implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
 }

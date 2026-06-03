@@ -149,7 +149,7 @@ class YoloBenchmarkActivity : ComponentActivity() {
         val resolutionLabels = resolutions.map { "${it}px" }.toTypedArray()
         val checkedItems = resolutions.map { selectedResolutions.contains(it) }.toBooleanArray()
 
-        AlertDialog.Builder(this, R.style.DarkDialogTheme)
+        AlertDialog.Builder(this)
             .setTitle("Select Resolutions")
             .setMultiChoiceItems(resolutionLabels, checkedItems) { _, which, isChecked ->
                 if (isChecked) {

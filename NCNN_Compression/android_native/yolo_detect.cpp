@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -14,6 +15,8 @@ struct Args {
     std::string bin_path;
     std::string image_ppm;
     int imgsz = 640;
+    int threads = 4;
+    std::string runtime = "ncnn_cpu";
     float conf = 0.25f;
     float iou = 0.6f;
     int max_det = 100;
@@ -21,6 +24,19 @@ struct Args {
 
 static bool starts_with(const std::string& s, const std::string& p) {
     return s.rfind(p, 0) == 0;
+}
+
+static std::string lower_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    return s;
+}
+
+static bool runtime_wants_vulkan(const std::string& runtime) {
+    std::string r = lower_copy(runtime);
+    return r == "gpu" || r == "vulkan" || r == "ncnn_gpu" ||
+           r == "ncnn-gpu" || r == "ncnn_vulkan" || r == "ncnn-vulkan";
 }
 
 static bool parse_args(int argc, char** argv, Args& a) {
@@ -48,6 +64,19 @@ static bool parse_args(int argc, char** argv, Args& a) {
             const char* v = need("--imgsz");
             if (!v) return false;
             a.imgsz = std::atoi(v);
+        } else if (k == "--threads") {
+            const char* v = need("--threads");
+            if (!v) return false;
+            a.threads = std::max(1, std::atoi(v));
+        } else if (k == "--runtime" || k == "--backend") {
+            const char* v = need("--runtime");
+            if (!v) return false;
+            a.runtime = v;
+        } else if (k == "--use_gpu") {
+            const char* v = need("--use_gpu");
+            if (!v) return false;
+            int flag = std::atoi(v);
+            a.runtime = flag ? "ncnn_vulkan" : "ncnn_cpu";
         } else if (k == "--conf") {
             const char* v = need("--conf");
             if (!v) return false;
@@ -358,6 +387,7 @@ int main(int argc, char** argv) {
     if (!parse_args(argc, argv, a)) {
         std::cerr << "Usage:\n"
                   << "  xtrim_yolo_detect --param model.param --bin model.bin --image input.ppm "
+                  << "--runtime ncnn_cpu|ncnn_vulkan --threads 4 "
                   << "--imgsz 640 --conf 0.25 --iou 0.6 --max_det 100\n";
         return 2;
     }
@@ -379,9 +409,20 @@ int main(int argc, char** argv) {
     LetterboxInfo lb;
     ncnn::Mat in = letterbox_to_square(im, a.imgsz, lb);
 
+    bool use_vulkan = runtime_wants_vulkan(a.runtime);
     ncnn::Net net;
+#if NCNN_VULKAN
+    net.opt.use_vulkan_compute = use_vulkan;
+#else
+    if (use_vulkan) {
+        std::cerr << "Requested runtime=" << a.runtime
+                  << " but this binary was built without NCNN_VULKAN; using CPU.\n";
+    }
     net.opt.use_vulkan_compute = false;
-    net.opt.num_threads = 4;
+#endif
+    net.opt.num_threads = std::max(1, a.threads);
+    std::cout << "# runtime=" << (use_vulkan ? "ncnn_vulkan" : "ncnn_cpu")
+              << " threads=" << net.opt.num_threads << "\n";
 
     if (net.load_param(a.param_path.c_str()) != 0) {
         std::cerr << "load_param failed\n";

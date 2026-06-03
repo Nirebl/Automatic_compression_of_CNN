@@ -19,4 +19,5 @@ target_link_libraries(xtrim_yolo_detect
     ncnn
     z
     log
+    vulkan
 )
