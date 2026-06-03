@@ -35,6 +35,8 @@ def test_android_app_bench_run_once_success_and_helpers(tmp_path, monkeypatch):
     out = bench.run_once(device=dev, local_param=tmp_path / "m.param", local_bin=tmp_path / "m.bin")
 
     assert out["avg_ms"] == 2.5
+    assert out["runtime"] == "ncnn_cpu"
+    assert out["use_gpu"] is False
     assert any(args[:2] == ("push", str(tmp_path / "m.param")) for args in calls)
     assert any(args[:2] == ("logcat", "-c") for args in calls)
 
@@ -70,7 +72,10 @@ def test_android_ort_run_once_success_and_timeout(tmp_path, monkeypatch):
 
     monkeypatch.setattr(bench, "adb", fake_adb)
     out = bench.run_once(device=dev, local_onnx=tmp_path / "m.onnx")
-    assert out == {"avg_ms": 1.0, "run_id": "run1234567"}
+    assert out["avg_ms"] == 1.0
+    assert out["run_id"] == "run1234567"
+    assert out["backend"] == "ort"
+    assert out["provider"] == "xnnpack"
 
     timeout_bench = AndroidOrtBench(ToolsConfig(), OrtAndroidBenchConfig(enabled=True, clear_logcat=True, poll_interval_sec=0.0, timeout_sec=0))
     monkeypatch.setattr(timeout_bench, "is_device_ready", lambda _d: True)
@@ -126,3 +131,33 @@ def test_adb_demo_failure_branches(tmp_path, monkeypatch):
 
     with pytest.raises(RuntimeError, match="binary not found"):
         demo.ensure_binary(dev)
+
+
+def test_android_app_bench_passes_explicit_ncnn_vulkan_runtime(tmp_path, monkeypatch):
+    cfg = AndroidAppBenchConfig(enabled=True, clear_logcat=False, poll_interval_sec=0.0)
+    bench = AndroidAppBench(ToolsConfig(), cfg)
+    dev = DeviceConfig(name="phone_gpu", serial="s", runtime="ncnn_vulkan", cooling_down=0)
+    calls = []
+
+    monkeypatch.setattr("xtrim.android_app_bench.uuid.uuid4", lambda: types.SimpleNamespace(hex="abc1234567dead"))
+    monkeypatch.setattr("xtrim.android_app_bench.time.sleep", lambda *_: None)
+
+    def fake_adb(_serial: str, *args: str) -> str:
+        calls.append(args)
+        if args == ("get-state",):
+            return "device\n"
+        if args[:1] == ("logcat",) and "-d" in args:
+            return '{"avg_ms": 3.0, "run_id": "abc1234567"}'
+        return ""
+
+    monkeypatch.setattr(bench, "adb", fake_adb)
+    out = bench.run_once(device=dev, local_param=tmp_path / "m.param", local_bin=tmp_path / "m.bin")
+
+    start_cmd = next(args for args in calls if args[:4] == ("shell", "am", "start", "-W"))
+    assert "--es" in start_cmd
+    assert "runtime" in start_cmd
+    assert "ncnn_vulkan" in start_cmd
+    assert "gpu_device" in start_cmd
+    assert "0" in start_cmd
+    assert out["runtime"] == "ncnn_vulkan"
+    assert out["use_gpu"] is True

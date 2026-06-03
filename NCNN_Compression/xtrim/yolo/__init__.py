@@ -7,7 +7,9 @@ without requiring the full Ultralytics runtime at package-import time.
 __all__ = [
     "build_ultralytics_candidate",
     "eval_ultralytics_map",
+    "eval_ultralytics_metrics",
     "eval_exported_onnx_map",
+    "eval_exported_onnx_metrics",
     "make_ultralytics_export_onnx_fn",
     "save_student_torchscript",
     "warmstart_noop",

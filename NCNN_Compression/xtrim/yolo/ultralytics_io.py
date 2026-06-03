@@ -962,6 +962,115 @@ def _extract_map5095(res: Any) -> float:
     return 0.0
 
 
+
+def _try_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_from_result_dict(res: Any, keys: tuple[str, ...]) -> Optional[float]:
+    dicts = []
+    if isinstance(res, dict):
+        dicts.append(res)
+    if isinstance(res, SimpleNamespace):
+        dicts.append(res.__dict__)
+    if hasattr(res, "results_dict") and isinstance(getattr(res, "results_dict"), dict):
+        dicts.append(getattr(res, "results_dict"))
+
+    for d in dicts:
+        for k in keys:
+            if k in d:
+                value = _try_float(d[k])
+                if value is not None:
+                    return value
+    return None
+
+
+def _extract_box_attr(res: Any, attrs: tuple[str, ...]) -> Optional[float]:
+    box = getattr(res, "box", None)
+    if box is None:
+        return None
+    for attr in attrs:
+        if hasattr(box, attr):
+            value = _try_float(getattr(box, attr))
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_detection_metrics(res: Any) -> dict[str, float]:
+    """Extract YOLO detection metrics from an Ultralytics val() result.
+
+    The returned keys are stable for the rest of the pipeline:
+    - map50_95: COCO-style mAP@[0.50:0.95], used as the main acc metric;
+    - precision: mean box precision;
+    - recall: mean box recall;
+    - iou: mean IoU for matched detections when provided by the evaluator;
+    - map50: mAP@0.50, kept in history for compatibility.
+
+    Note: standard Ultralytics detection validation does not always expose a
+    separate aggregate IoU metric. In that case the key is omitted and the
+    reporting table will show "---" unless a custom evaluator provides it.
+    Missing optional metrics are simply omitted instead of being forced to 0.
+    """
+    metrics: dict[str, float] = {}
+
+    map50_95 = _try_float(_extract_map5095(res))
+    if map50_95 is not None:
+        metrics["map50_95"] = map50_95
+
+    precision = _extract_from_result_dict(
+        res,
+        ("metrics/precision(B)", "metrics/precision", "box/mp", "precision", "mp"),
+    )
+    if precision is None:
+        precision = _extract_box_attr(res, ("mp", "precision"))
+    if precision is not None:
+        metrics["precision"] = precision
+
+    recall = _extract_from_result_dict(
+        res,
+        ("metrics/recall(B)", "metrics/recall", "box/mr", "recall", "mr"),
+    )
+    if recall is None:
+        recall = _extract_box_attr(res, ("mr", "recall"))
+    if recall is not None:
+        metrics["recall"] = recall
+
+    iou = _extract_from_result_dict(
+        res,
+        (
+            "metrics/IoU(B)",
+            "metrics/IoU",
+            "metrics/iou(B)",
+            "metrics/iou",
+            "box/iou",
+            "iou",
+            "mean_iou",
+            "miou",
+            "mIoU",
+        ),
+    )
+    if iou is None:
+        iou = _extract_box_attr(res, ("iou", "mean_iou", "miou"))
+    if iou is not None:
+        metrics["iou"] = iou
+
+    map50 = _extract_from_result_dict(
+        res,
+        ("metrics/mAP50(B)", "metrics/mAP50", "box/map50", "map50"),
+    )
+    if map50 is None:
+        map50 = _extract_box_attr(res, ("map50",))
+    if map50 is not None:
+        metrics["map50"] = map50
+
+    return metrics
+
 def _make_eval_yolo_copy(student: UltralyticsStudent, model_cfg: ModelConfig):
     """
     Build a throwaway YOLO wrapper around a deepcopy of the student model.
@@ -985,20 +1094,28 @@ def _make_eval_yolo_copy(student: UltralyticsStudent, model_cfg: ModelConfig):
     return eval_yolo
 
 
-def eval_ultralytics_map(student: UltralyticsStudent, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> float:
+def eval_ultralytics_metrics(student: UltralyticsStudent, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> dict[str, float]:
     # Important for YOLO26: val() may fuse a PyTorch model in-place, which removes
     # one2many from an end-to-end Detect head. Evaluate a deepcopy and keep the
     # original student trainable for possible QAT recovery.
     eval_yolo = _make_eval_yolo_copy(student, model_cfg)
     res = eval_yolo.val(**_val_kwargs(model_cfg, eval_cfg))
-    return _extract_map5095(res)
+    return _extract_detection_metrics(res)
 
 
-def eval_exported_onnx_map(onnx_path: Path, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> float:
+def eval_ultralytics_map(student: UltralyticsStudent, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> float:
+    return float(eval_ultralytics_metrics(student, model_cfg, eval_cfg).get("map50_95", 0.0))
+
+
+def eval_exported_onnx_metrics(onnx_path: Path, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> dict[str, float]:
     from ultralytics import YOLO
     y = YOLO(str(onnx_path))
     res = y.val(**_val_kwargs(model_cfg, eval_cfg))
-    return _extract_map5095(res)
+    return _extract_detection_metrics(res)
+
+
+def eval_exported_onnx_map(onnx_path: Path, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> float:
+    return float(eval_exported_onnx_metrics(onnx_path, model_cfg, eval_cfg).get("map50_95", 0.0))
 
 
 def make_ultralytics_export_onnx_fn(
@@ -1129,6 +1246,157 @@ def _inject_ultralytics_metadata(onnx_path: Path, student: Any, model_cfg: Any) 
 
     onnx.save(m, str(onnx_path))
 
+
+
+def _find_tflite_file(root: Path) -> Optional[Path]:
+    files = sorted(root.rglob("*.tflite"), key=lambda p: (len(p.parts), str(p)))
+    return files[0] if files else None
+
+
+def _find_tflite_file_by_priority(root: Path, priority_words: tuple[str, ...]) -> Optional[Path]:
+    files = list(root.rglob("*.tflite"))
+    if not files:
+        return None
+
+    def score(path: Path) -> tuple[int, int, str]:
+        text = path.name.lower()
+        value = 0
+        for i, word in enumerate(priority_words):
+            if word.lower() in text:
+                value += 100 - i
+        return (-value, len(path.parts), str(path))
+
+    files.sort(key=score)
+    return files[0]
+
+
+def make_ultralytics_export_tflite_int8_fn(
+    student: "UltralyticsStudent",
+    model_cfg: ModelConfig,
+    export_cfg: ExportConfig,
+) -> Callable[[Path], Path]:
+    """Return a callable that exports the current model to INT8 TFLite.
+
+    The important detail is that the export is performed from a temporary .pt
+    checkpoint saved inside the candidate run directory. This avoids the older
+    behavior where Ultralytics tried to create/use ``best.onnx`` next to the
+    original source checkpoint (for example inside ``coco_baselines/...``),
+    which made TFLite export fail even though the pipeline's own
+    ``run_dir/export/model.onnx`` was already available.
+
+    The TFLite export is forced to CPU by default. ``model.device`` still
+    controls PyTorch training/validation, but TensorFlow/TFLite conversion does
+    not benefit from selecting CUDA here and Ultralytics may otherwise try to
+    install/use ``onnxruntime-gpu`` during export.
+    """
+
+    def _export(tflite_path: Path) -> Path:
+        import os
+        import shutil
+        import tempfile
+
+        from ultralytics import YOLO
+
+        ensure_dir(tflite_path.parent)
+        if tflite_path.exists():
+            tflite_path.unlink()
+
+        old_cwd = Path.cwd()
+        export_device = str(getattr(export_cfg, "tflite_int8_device", "cpu") or "cpu")
+        simplify = bool(getattr(export_cfg, "tflite_int8_simplify", False))
+
+        with tempfile.TemporaryDirectory(prefix="xtrim_tflite_int8_", dir=str(tflite_path.parent)) as tmp:
+            tmp_dir = Path(tmp)
+            tmp_pt = tmp_dir / "xtrim_tflite_export.pt"
+
+            # Save a self-contained checkpoint of the current pruned/recovered
+            # Ultralytics model and reload it. Calling export() on student.yolo
+            # directly may reuse the original .pt path and make Ultralytics look
+            # for <original>/best.onnx instead of using this candidate's files.
+            #
+            # Important for QAT candidates: fake quantization temporarily
+            # monkey-patches Ultralytics Conv.forward. If such a module is saved
+            # as-is and later reloaded, TFLite export may fail with
+            # "'Conv' object has no attribute '_forward'". Restore the original
+            # class-level forward before saving the temporary checkpoint.
+            try:
+                from ..quant.fake_quant_ultra import unpatch_ultralytics_convs_for_fake_quant
+
+                restored = unpatch_ultralytics_convs_for_fake_quant(student.torch_model)
+                if restored:
+                    print(f"[tflite] restored fake-quant patched Conv.forward in {restored} modules before export")
+            except Exception as exc:
+                print(f"[tflite] warning: could not restore fake-quant Conv.forward hooks before export: {exc}")
+
+            try:
+                student.yolo.save(str(tmp_pt))
+            except Exception as exc:
+                raise RuntimeError(f"Could not save temporary YOLO checkpoint for TFLite export: {exc}") from exc
+            if not tmp_pt.exists():
+                raise RuntimeError(f"Temporary YOLO checkpoint was not created: {tmp_pt}")
+
+            export_yolo = YOLO(str(tmp_pt))
+            try:
+                os.chdir(tmp_dir)
+                result = export_yolo.export(
+                    format="tflite",
+                    imgsz=int(model_cfg.imgsz),
+                    int8=True,
+                    data=str(model_cfg.data),
+                    batch=1,
+                    device=export_device,
+                    nms=False,
+                    simplify=simplify,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            # onnx2tf/Ultralytics often creates several .tflite variants in
+            # the temporary export directory.  Select the actual full-integer
+            # variant for model_int8.tflite and optionally copy float16 for the
+            # GPU-delegate benchmark.
+            int8_priority = (
+                "full_integer_quant",
+                "integer_quant",
+                "int8",
+                "quant",
+            )
+            src = _find_tflite_file_by_priority(tmp_dir, int8_priority)
+
+            # If Ultralytics returned a concrete .tflite file, still consider it
+            # only as a fallback.  Some versions return float32/float16 first.
+            if src is None and result is not None:
+                rp = Path(str(result))
+                if not rp.is_absolute():
+                    rp = tmp_dir / rp
+                if rp.is_file() and rp.suffix.lower() == ".tflite":
+                    src = rp
+                elif rp.is_dir():
+                    src = _find_tflite_file_by_priority(rp, int8_priority) or _find_tflite_file(rp)
+
+            if src is None or not src.exists():
+                raise RuntimeError(
+                    "Ultralytics TFLite INT8 export finished but no .tflite file was found "
+                    f"under temporary export directory: {tmp_dir}"
+                )
+            shutil.copy2(src, tflite_path)
+
+            if bool(getattr(export_cfg, "tflite_fp16", False)):
+                fp16_name = str(getattr(export_cfg, "tflite_fp16_name", "model_fp16.tflite") or "model_fp16.tflite")
+                fp16_path = tflite_path.parent / fp16_name
+                fp16_src = _find_tflite_file_by_priority(tmp_dir, ("float16", "fp16"))
+                if fp16_src is not None and fp16_src.exists():
+                    if fp16_path.exists():
+                        fp16_path.unlink()
+                    shutil.copy2(fp16_src, fp16_path)
+                elif bool(getattr(export_cfg, "tflite_fp16_required", False)):
+                    raise RuntimeError("TFLite FP16 export was requested but no float16 .tflite file was produced")
+
+        if not tflite_path.exists():
+            raise RuntimeError(f"TFLite INT8 export did not create file: {tflite_path}")
+        return tflite_path
+
+    return _export
 
 def save_student_torchscript(student: UltralyticsStudent, pt_path: Path) -> None:
     student.torch_model.eval()

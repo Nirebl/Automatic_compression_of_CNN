@@ -30,9 +30,13 @@ from .types import (
     TrimConfig,
     StagedPruningConfig,
     OrtAndroidBenchConfig,
+    BenchmarkProfileConfig,
+    NcnnModelPaths,
 )
 from .android_app_bench import AndroidAppBench, AndroidAppBenchConfig
 from .android_ort_bench import AndroidOrtBench
+from .android_tflite_bench import AndroidTfliteBench
+from .runtime_backend import effective_ncnn_gpu_device, ncnn_runtime_label
 from .android_dataset import AndroidDatasetSubset, prepare_android_dataset_subset
 from .utils import ensure_dir, sizeof_file, write_json, now_ts, sha256_file
 
@@ -62,13 +66,17 @@ class XTrimOrchestrator:
         finetune_fn: Callable[[Any, TrainConfig], Any],
         finetune_qat_fn: Optional[Callable[[Any, TrainConfig], Any]] = None,
         eval_acc_fn: Callable[[Any], float] = lambda _: 0.0,
+        eval_metrics_fn: Optional[Callable[[Any], Dict[str, float]]] = None,
         export_onnx_fn_factory: Callable[[Any, ExportConfig], Callable[[Path], None]] = lambda _m, _c: (lambda _p: None),
+        export_tflite_int8_fn_factory: Optional[Callable[[Any, ExportConfig], Callable[[Path], Path]]] = None,
         eval_exported_onnx_fn: Optional[Callable[[Path], float]] = None,
+        eval_exported_onnx_metrics_fn: Optional[Callable[[Path], Dict[str, float]]] = None,
         quantize_onnx_fn: Optional[Callable[[Path, Path, Path], Path]] = None,
         save_student_pt_fn: Optional[Callable[[Any, Path], None]] = None,
         android_app_bench_cfg: AndroidAppBenchConfig,
         ort_android_bench_cfg: OrtAndroidBenchConfig,
         dataset_yaml: str = "coco128.yaml",
+        benchmark_profiles: Optional[List[BenchmarkProfileConfig]] = None,
     ):
         self.out_root = out_root
         self.tools = tools
@@ -92,8 +100,11 @@ class XTrimOrchestrator:
         self.finetune_fn = finetune_fn
         self.finetune_qat_fn = finetune_qat_fn
         self.eval_acc_fn = eval_acc_fn
+        self.eval_metrics_fn = eval_metrics_fn
         self.export_onnx_fn_factory = export_onnx_fn_factory
+        self.export_tflite_int8_fn_factory = export_tflite_int8_fn_factory
         self.eval_exported_onnx_fn = eval_exported_onnx_fn
+        self.eval_exported_onnx_metrics_fn = eval_exported_onnx_metrics_fn
         self.quantize_onnx_fn = quantize_onnx_fn
         self.save_student_pt_fn = save_student_pt_fn
 
@@ -106,6 +117,7 @@ class XTrimOrchestrator:
         self.ort_android_bench_cfg = ort_android_bench_cfg
         self.android_ort = AndroidOrtBench(tools, ort_android_bench_cfg)
         self.dataset_yaml = str(dataset_yaml)
+        self.benchmark_profiles = list(benchmark_profiles or [])
 
         ensure_dir(self.out_root)
         self.history_path = self.out_root / "history.jsonl"
@@ -117,11 +129,16 @@ class XTrimOrchestrator:
 
         self.policy = SearchPolicy.create(search_cfg, search_space)
 
-    def run(self, max_candidates: Optional[int] = None) -> List[HistoryItem]:
-        history: List[HistoryItem] = self._load_history()
-        self._ensure_reference_baseline(history)
 
-        backend = str(self.latency_cfg.backend).lower().strip()
+    def prepare_benchmark_devices(self) -> List[DeviceConfig]:
+        """Prepare and keep only Android devices usable for the configured benchmarks.
+
+        This public wrapper is used by --rebench-existing.  The normal run() path
+        uses the same logic before candidate processing, so rebench and full runs
+        validate devices consistently.
+        """
+        backends_to_prepare = {str(self.latency_cfg.backend).lower().strip()}
+        backends_to_prepare.update(p.backend.lower().strip() for p in self._active_benchmark_profiles())
 
         ready_devices: List[DeviceConfig] = []
         for d in self.devices:
@@ -129,7 +146,7 @@ class XTrimOrchestrator:
                 print(f"[warn] device {d.name} not ready (adb get-state != device)", file=sys.stderr)
                 continue
 
-            if backend == "benchncnn":
+            if "benchncnn" in backends_to_prepare:
                 try:
                     self.bench.ensure_benchncnn(d, force_push=False)
                 except Exception as e:
@@ -137,7 +154,15 @@ class XTrimOrchestrator:
                     continue
 
             ready_devices.append(d)
+
         self.devices = ready_devices
+        return ready_devices
+
+    def run(self, max_candidates: Optional[int] = None) -> List[HistoryItem]:
+        history: List[HistoryItem] = self._load_history()
+        self._ensure_reference_baseline(history)
+
+        self.prepare_benchmark_devices()
 
         count = 0
         while True:
@@ -220,14 +245,378 @@ class XTrimOrchestrator:
         size_term = math.log1p(size_mb)
         return float(acc - a * lat_term - b * size_term)
 
+    def _active_benchmark_profiles(self) -> List[BenchmarkProfileConfig]:
+        return [p for p in self.benchmark_profiles if bool(p.enabled)]
+
+    def _benchmark_profiles_require_backend(self, backend: str) -> bool:
+        backend = backend.lower().strip()
+        return any(p.backend.lower().strip() == backend for p in self._active_benchmark_profiles())
+
+    def _benchmark_profiles_require_ncnn(self) -> bool:
+        return any(
+            p.backend.lower().strip() in {"benchncnn", "android_app", "ncnn"}
+            for p in self._active_benchmark_profiles()
+        )
+
+
+    def _export_config_requests_ncnn(self) -> bool:
+        return bool(getattr(self.export_cfg, "ncnn", False))
+
+    def _needs_ncnn_artifact(self) -> bool:
+        backend = str(self.latency_cfg.backend).lower().strip()
+        return (
+            backend not in {"ort_android", "ort", "onnx"}
+            or self._benchmark_profiles_require_ncnn()
+            or self._export_config_requests_ncnn()
+            or bool(getattr(self.android_demo_cfg, "enabled", False))
+        )
+
+    def _ncnn_int8_enabled(self) -> bool:
+        explicit = getattr(self.export_cfg, "ncnn_int8", None)
+        if explicit is None:
+            # Legacy behavior: old NCNN-only experiments used ptq.enabled to mean
+            # ncnn2table/ncnn2int8. New ONNX+NCNN configs should set
+            # export.ncnn_int8=false to keep NCNN as FP32/FP16-compatible.
+            return bool(self.ptq_cfg.enabled)
+        return bool(explicit)
+
+    def _select_ncnn_source_onnx(
+        self,
+        *,
+        onnx_fp32: Path,
+        onnx_qat: Optional[Path] = None,
+        deploy_onnx: Optional[Path] = None,
+        deploy_onnx_kind: str = "",
+    ) -> tuple[Path, str]:
+        source = str(getattr(self.export_cfg, "ncnn_source", "qat_fp32") or "qat_fp32").lower().strip()
+
+        if source in {"fp32", "raw_fp32", "model", "before_qat"}:
+            return onnx_fp32, "onnx_fp32"
+
+        if source in {"qat", "qat_fp32", "after_qat"}:
+            if onnx_qat is not None and onnx_qat.exists():
+                return onnx_qat, "onnx_qat_fp32"
+            return onnx_fp32, "onnx_fp32_fallback_no_qat"
+
+        if source in {"deploy_fp32", "selected_fp32"}:
+            # Never convert ONNX INT8/QDQ to NCNN by accident. If the selected
+            # deploy artifact is INT8 after QAT, use the QAT FP32 ONNX as the
+            # NCNN source. If it is INT8 before QAT, use the original FP32 ONNX.
+            if deploy_onnx_kind in {"qat_fp32", "int8_after_qat"} and onnx_qat is not None and onnx_qat.exists():
+                return onnx_qat, "onnx_qat_fp32_for_deploy"
+            return onnx_fp32, "onnx_fp32_for_deploy"
+
+        if source in {"deploy", "selected"}:
+            # This mode is explicit and intentionally allows converting the
+            # selected deploy ONNX. For normal experiments prefer deploy_fp32.
+            if deploy_onnx is not None and deploy_onnx.exists():
+                return deploy_onnx, f"onnx_selected_{deploy_onnx_kind or 'unknown'}"
+            return onnx_fp32, "onnx_fp32_fallback_no_deploy"
+
+        return onnx_qat if (onnx_qat is not None and onnx_qat.exists()) else onnx_fp32, f"onnx_auto_unknown_source_{source}"
+
+    def _prepare_ncnn_from_onnx(
+        self,
+        *,
+        source_onnx: Path,
+        ncnn_dir: Path,
+        extra: Dict[str, Any],
+        source_label: str,
+        pnnx_ncnn: Optional[NcnnModelPaths] = None,
+        apply_int8: bool = True,
+    ) -> Optional[NcnnModelPaths]:
+        ensure_dir(ncnn_dir)
+        try:
+            if pnnx_ncnn is not None:
+                ncnn_float = pnnx_ncnn
+                source_label = "pnnx"
+            else:
+                ncnn_float = self.converter.onnx_to_ncnn(source_onnx, ncnn_dir / "float")
+            ncnn_final = self.converter.optimize(ncnn_float, ncnn_dir / "opt") if bool(getattr(self.export_cfg, "ncnn_optimize", True)) else ncnn_float
+
+            if apply_int8 and self._ncnn_int8_enabled():
+                auto_calib = ncnn_dir.parent / "ptq" / "calib_images.txt"
+                ptq_cfg_resolved = self.ptq_cfg
+                if auto_calib.exists():
+                    ptq_cfg_resolved = dataclasses.replace(self.ptq_cfg, imagelist=str(auto_calib))
+                ncnn_final = self.converter.ptq_int8(ncnn_final, ncnn_dir / "int8", ptq_cfg_resolved)
+                extra["ncnn_int8"] = True
+                source_label = "ncnn_int8"
+            else:
+                extra["ncnn_int8"] = False
+
+            extra["ncnn_source"] = source_label
+            extra["ncnn_source_onnx_path"] = str(source_onnx)
+            extra["deploy_ncnn_param"] = str(ncnn_final.param)
+            extra["deploy_ncnn_bin"] = str(ncnn_final.bin)
+            extra["ncnn_export"] = "ok"
+            return ncnn_final
+        except Exception as exc:
+            extra["ncnn_export"] = "failed"
+            extra["ncnn_export_failed"] = str(exc)
+            extra["ncnn_source"] = source_label
+            extra["ncnn_source_onnx_path"] = str(source_onnx)
+            if bool(getattr(self.export_cfg, "ncnn_required", False)):
+                raise
+            print(f"[warn] NCNN export failed for {source_onnx}: {exc}", file=sys.stderr)
+            return None
+
+    def prepare_ncnn_from_existing_onnx(
+        self,
+        *,
+        source_onnx: Path,
+        run_dir: Path,
+        extra: Optional[Dict[str, Any]] = None,
+        source_label: str = "existing_onnx_fp32",
+    ) -> tuple[Optional[NcnnModelPaths], Dict[str, Any]]:
+        """Convert an already existing ONNX file to NCNN for --rebench-existing.
+
+        This is intentionally public-ish because rebench works without rebuilding
+        the model. It lets a rebench config add NCNN CPU/Vulkan profiles even if
+        the original experiment saved only ONNX artifacts.
+        """
+        extra_out: Dict[str, Any] = dict(extra or {})
+        ncnn = self._prepare_ncnn_from_onnx(
+            source_onnx=source_onnx,
+            ncnn_dir=run_dir / "ncnn",
+            extra=extra_out,
+            source_label=source_label,
+        )
+        return ncnn, extra_out
+
+    @staticmethod
+    def _profile_backend(profile: BenchmarkProfileConfig) -> str:
+        backend = str(profile.backend).lower().strip()
+        if backend == "ncnn":
+            return "android_app"
+        if backend in {"tflite", "tflite_android", "android_tflite"}:
+            return "tflite_android"
+        return backend
+
+    @staticmethod
+    def _profile_display_name(profile: BenchmarkProfileConfig, index: int) -> str:
+        name = str(profile.name or profile.backend or f"profile_{index + 1}").strip()
+        return name or f"profile_{index + 1}"
+
+    @staticmethod
+    def _profile_log_name(profile_name: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in profile_name.strip())
+        return safe or "profile"
+
+    def _devices_for_profile(self, profile: BenchmarkProfileConfig) -> List[DeviceConfig]:
+        wanted = {str(x) for x in (profile.device_names or ())}
+        selected = [
+            d for d in self.devices
+            if not wanted or d.name in wanted or d.serial in wanted
+        ]
+
+        patched: List[DeviceConfig] = []
+        for d in selected:
+            overrides: Dict[str, Any] = {}
+            for key in ("threads", "loops", "powersave", "runtime", "device", "gpu_device", "cooling_down"):
+                value = getattr(profile, key, None)
+                if value is not None:
+                    overrides[key] = value
+            patched.append(dataclasses.replace(d, **overrides) if overrides else d)
+        return patched
+
+    @staticmethod
+    def _cfg_overrides_from_profile(profile: BenchmarkProfileConfig, allowed: List[str]) -> Dict[str, Any]:
+        overrides: Dict[str, Any] = {}
+        for key in allowed:
+            value = getattr(profile, key, None)
+            if value is not None:
+                overrides[key] = value
+        return overrides
+
+    def _ort_cfg_for_profile(self, profile: BenchmarkProfileConfig) -> OrtAndroidBenchConfig:
+        allowed = [
+            "package", "activity", "dataset", "push_dataset_images", "dataset_split",
+            "dataset_max_images", "dataset_seed", "dataset_remote_subdir", "imgsz",
+            "loops", "warmup", "threads", "conf", "iou", "max_det", "provider",
+            "result_tag", "timeout_sec", "poll_interval_sec", "clear_logcat", "remote_dir",
+        ]
+        return dataclasses.replace(self.ort_android_bench_cfg, **self._cfg_overrides_from_profile(profile, allowed))
+
+    def _android_app_cfg_for_profile(self, profile: BenchmarkProfileConfig) -> AndroidAppBenchConfig:
+        allowed = [
+            "package", "activity", "dataset", "push_dataset_images", "dataset_split",
+            "dataset_max_images", "dataset_seed", "dataset_remote_subdir", "imgsz",
+            "loops", "warmup", "threads", "conf", "iou", "max_det", "optimized",
+            "result_tag", "timeout_sec", "poll_interval_sec", "clear_logcat", "remote_dir",
+        ]
+        return dataclasses.replace(self.android_app_bench_cfg, **self._cfg_overrides_from_profile(profile, allowed))
+
+    def _tflite_cfg_for_profile(self, profile: BenchmarkProfileConfig) -> OrtAndroidBenchConfig:
+        # TFLite CliBenchActivity accepts almost the same launch extras as the
+        # ORT path. Reuse ort_android_bench as the base block to avoid a large
+        # duplicated YAML section. The actual TFLite delegate is stored on the
+        # profile as delegate/provider.
+        allowed = [
+            "package", "activity", "dataset", "push_dataset_images", "dataset_split",
+            "dataset_max_images", "dataset_seed", "dataset_remote_subdir", "imgsz",
+            "loops", "warmup", "threads", "conf", "iou", "max_det",
+            "result_tag", "timeout_sec", "poll_interval_sec", "clear_logcat", "remote_dir",
+        ]
+        return dataclasses.replace(self.ort_android_bench_cfg, **self._cfg_overrides_from_profile(profile, allowed))
+
+    @staticmethod
+    def _profile_tflite_delegate(profile: BenchmarkProfileConfig) -> str:
+        return str(getattr(profile, "delegate", None) or getattr(profile, "provider", None) or "xnnpack").strip().lower()
+
+    @staticmethod
+    def _profile_artifact(profile: BenchmarkProfileConfig) -> str:
+        return str(getattr(profile, "artifact", None) or "").strip()
+
+    @staticmethod
+    def _normalize_eval_metrics(raw: Any, acc_fallback: Optional[float] = None) -> Dict[str, float]:
+        """Normalize evaluator output to the pipeline metric schema.
+
+        The optimization metric is stored as map50_95. Other metrics are optional,
+        because older tests/custom evaluators may still return only a scalar mAP.
+        """
+        metrics: Dict[str, float] = {}
+
+        def _put(dst_key: str, value: Any) -> None:
+            if value is None:
+                return
+            try:
+                metrics[dst_key] = float(value)
+            except (TypeError, ValueError):
+                return
+
+        if isinstance(raw, (int, float)):
+            _put("map50_95", raw)
+        elif isinstance(raw, dict):
+            for src_key in ("map50_95", "mAP50-95", "map", "acc", "accuracy"):
+                if src_key in raw:
+                    _put("map50_95", raw[src_key])
+                    break
+            for src_key in ("precision", "mp", "metrics/precision(B)", "metrics/precision"):
+                if src_key in raw:
+                    _put("precision", raw[src_key])
+                    break
+            for src_key in ("recall", "mr", "metrics/recall(B)", "metrics/recall"):
+                if src_key in raw:
+                    _put("recall", raw[src_key])
+                    break
+            for src_key in ("iou", "IoU", "mean_iou", "miou", "mIoU", "metrics/IoU(B)", "metrics/IoU", "metrics/iou(B)", "metrics/iou", "box/iou"):
+                if src_key in raw:
+                    _put("iou", raw[src_key])
+                    break
+            for src_key in ("map50", "mAP50", "metrics/mAP50(B)", "metrics/mAP50"):
+                if src_key in raw:
+                    _put("map50", raw[src_key])
+                    break
+
+        if "map50_95" not in metrics and acc_fallback is not None:
+            _put("map50_95", acc_fallback)
+        return metrics
+
+    def _eval_student_metrics(self, student: Any) -> Dict[str, float]:
+        if self.eval_metrics_fn is not None:
+            metrics = self._normalize_eval_metrics(self.eval_metrics_fn(student))
+        else:
+            metrics = self._normalize_eval_metrics(float(self.eval_acc_fn(student)))
+        if "map50_95" not in metrics:
+            raise RuntimeError(f"student evaluator returned no map50_95/acc metric: {metrics}")
+        return metrics
+
+    def _eval_exported_onnx_metrics(self, onnx_path: Path) -> Dict[str, float]:
+        if self.eval_exported_onnx_metrics_fn is not None:
+            metrics = self._normalize_eval_metrics(self.eval_exported_onnx_metrics_fn(onnx_path))
+        elif self.eval_exported_onnx_fn is not None:
+            metrics = self._normalize_eval_metrics(float(self.eval_exported_onnx_fn(onnx_path)))
+        else:
+            return {}
+        if "map50_95" not in metrics:
+            raise RuntimeError(f"ONNX evaluator returned no map50_95/acc metric for {onnx_path}: {metrics}")
+        return metrics
+
+    @staticmethod
+    def _metric_stage_from_acc_key(acc_key: str) -> str:
+        return acc_key[4:] if acc_key.startswith("acc_") else acc_key
+
+    def _store_eval_metrics(self, extra: Dict[str, Any], acc_key: str, metrics: Dict[str, float]) -> None:
+        metrics = self._normalize_eval_metrics(metrics)
+        if "map50_95" in metrics:
+            extra[acc_key] = float(metrics["map50_95"])
+
+        stage = self._metric_stage_from_acc_key(acc_key)
+        compact: Dict[str, float] = {}
+        for metric_key in ("map50_95", "precision", "recall", "iou", "map50"):
+            if metric_key not in metrics:
+                continue
+            value = float(metrics[metric_key])
+            compact[metric_key] = value
+            if metric_key == "precision":
+                extra[f"precision_{stage}"] = value
+            elif metric_key == "recall":
+                extra[f"recall_{stage}"] = value
+            elif metric_key == "iou":
+                extra[f"iou_{stage}"] = value
+            elif metric_key == "map50":
+                extra[f"map50_{stage}"] = value
+
+        if compact:
+            extra[f"metrics_{stage}"] = compact
+
+    @staticmethod
+    def _store_stage_metrics(stage_rec: Dict[str, Any], suffix: str, metrics: Dict[str, float]) -> None:
+        compact: Dict[str, float] = {}
+        for key in ("map50_95", "precision", "recall", "iou", "map50"):
+            if key not in metrics:
+                continue
+            try:
+                value = float(metrics[key])
+            except (TypeError, ValueError):
+                continue
+            compact[key] = value
+            if key == "precision":
+                stage_rec[f"precision_{suffix}"] = value
+            elif key == "recall":
+                stage_rec[f"recall_{suffix}"] = value
+            elif key == "iou":
+                stage_rec[f"iou_{suffix}"] = value
+            elif key == "map50":
+                stage_rec[f"map50_{suffix}"] = value
+        if compact:
+            stage_rec[f"metrics_{suffix}"] = compact
+
+    def _metrics_from_extra(self, extra: Dict[str, Any], acc_key: str) -> Dict[str, float]:
+        stage = self._metric_stage_from_acc_key(acc_key)
+        raw = extra.get(f"metrics_{stage}")
+        metrics = self._normalize_eval_metrics(raw if isinstance(raw, dict) else None)
+        if "map50_95" not in metrics and acc_key in extra:
+            try:
+                metrics["map50_95"] = float(extra[acc_key])
+            except (TypeError, ValueError):
+                pass
+        for metric_key, extra_key in (
+            ("precision", f"precision_{stage}"),
+            ("recall", f"recall_{stage}"),
+            ("iou", f"iou_{stage}"),
+            ("map50", f"map50_{stage}"),
+        ):
+            if metric_key not in metrics and extra_key in extra:
+                try:
+                    metrics[metric_key] = float(extra[extra_key])
+                except (TypeError, ValueError):
+                    pass
+        return metrics
+
     def _cache_key(self, device: DeviceConfig, model_hash: str, shape: str) -> str:
+        runtime = ncnn_runtime_label(device)
+        gpu_device = effective_ncnn_gpu_device(device)
         return "|".join([
-            "benchncnn",
+            "ncnn_android",
             f"serial={device.serial}",
+            f"device_name={device.name}",
+            f"runtime={runtime}",
             f"loops={device.loops}",
             f"threads={device.threads}",
             f"powersave={device.powersave}",
-            f"gpu={device.gpu_device}",
+            f"gpu={gpu_device}",
             f"cool={device.cooling_down}",
             f"shape={shape}",
             f"model={model_hash}",
@@ -288,7 +677,9 @@ class XTrimOrchestrator:
             "acc_kind": "mAP50-95",
         }
 
-        acc = float(self.eval_acc_fn(student))
+        recovered_metrics = self._eval_student_metrics(student)
+        acc = float(recovered_metrics["map50_95"])
+        self._store_eval_metrics(extra, "acc_recovered_torch", recovered_metrics)
 
         onnx_path = run_dir / "export" / "model.onnx"
         exporter = Exporter(self.export_onnx_fn_factory(student, self.export_cfg))
@@ -312,38 +703,85 @@ class XTrimOrchestrator:
         latency_ms: Dict[str, float] = {}
 
         backend = str(self.latency_cfg.backend).lower().strip()
+        profiles_active = bool(self._active_benchmark_profiles())
+        needs_ncnn = self._needs_ncnn_artifact()
+        ncnn_final = None
 
-        if backend == "ort_android":
-            size_bytes = int(sizeof_file(onnx_path))
+        extra["deploy_onnx_path"] = str(onnx_path)
+        extra["deploy_onnx_kind"] = "fp32_raw_baseline"
+
+        if needs_ncnn:
+            source_onnx, source_label = self._select_ncnn_source_onnx(
+                onnx_fp32=onnx_path,
+                onnx_qat=None,
+                deploy_onnx=onnx_path,
+                deploy_onnx_kind="fp32_raw_baseline",
+            )
+            ncnn_final = self._prepare_ncnn_from_onnx(
+                source_onnx=source_onnx,
+                ncnn_dir=run_dir / "ncnn",
+                extra=extra,
+                source_label=source_label,
+                pnnx_ncnn=_pnnx_ncnn if source_onnx == onnx_path else None,
+                apply_int8=False,
+            )
+
+        tflite_int8 = self._maybe_export_tflite_int8(student, run_dir, extra)
+        tflite_models = self._store_tflite_artifacts(run_dir, extra)
+
+        onnx_size_bytes = int(sizeof_file(onnx_path))
+        ncnn_size_bytes = int(sizeof_file(ncnn_final.param) + sizeof_file(ncnn_final.bin)) if ncnn_final is not None else None
+        tflite_int8_size_bytes = int(sizeof_file(tflite_int8)) if tflite_int8 is not None else None
+        extra["deploy_size_bytes_by_backend"] = {
+            "onnx": onnx_size_bytes,
+            **({"ncnn": ncnn_size_bytes} if ncnn_size_bytes is not None else {}),
+            **({"tflite_int8": tflite_int8_size_bytes} if tflite_int8_size_bytes is not None else {}),
+        }
+
+        if profiles_active:
+            latency_ms, profile_details = self._bench_latency_with_profiles(
+                ncnn_param=ncnn_final.param if ncnn_final is not None else None,
+                ncnn_bin=ncnn_final.bin if ncnn_final is not None else None,
+                onnx_model=onnx_path,
+                tflite_models=tflite_models,
+                run_dir=run_dir,
+            )
+            extra["benchmark_profiles"] = profile_details
+            extra["deploy_backend"] = "multi_profile"
+            extra["primary_latency_backend"] = backend
+            size_bytes = ncnn_size_bytes if backend != "ort_android" and ncnn_size_bytes is not None else onnx_size_bytes
+        elif backend == "ort_android":
+            size_bytes = onnx_size_bytes
             latency_ms = self._bench_latency(None, None, run_dir, onnx_model=onnx_path)
             extra["deploy_backend"] = "ort_android"
-            extra["deploy_onnx_path"] = str(onnx_path)
-            extra["deploy_onnx_kind"] = "fp32_raw_baseline"
         else:
-            ncnn_dir = run_dir / "ncnn"
-            ensure_dir(ncnn_dir)
-
-            if _pnnx_ncnn is not None:
-                ncnn_float = _pnnx_ncnn
-                extra["ncnn_source"] = "pnnx"
-            else:
-                ncnn_float = self.converter.onnx_to_ncnn(onnx_path, ncnn_dir / "float")
-                extra["ncnn_source"] = "onnx_fp32"
-
-            ncnn_final = self.converter.optimize(ncnn_float, ncnn_dir / "opt")
-            size_bytes = int(sizeof_file(ncnn_final.param) + sizeof_file(ncnn_final.bin))
+            if ncnn_final is None:
+                raise RuntimeError("NCNN model was not prepared for NCNN latency backend")
+            size_bytes = int(ncnn_size_bytes)
             latency_ms = self._bench_latency(ncnn_final.param, ncnn_final.bin, run_dir)
             extra["deploy_backend"] = "ncnn"
 
+        deploy_acc_source = "acc_onnx" if "acc_onnx" in extra else "acc_recovered_torch"
+        deploy_metrics = self._metrics_from_extra(extra, deploy_acc_source)
+        if "map50_95" not in deploy_metrics:
+            deploy_metrics = {"map50_95": float(acc)}
+        deploy_acc = float(deploy_metrics["map50_95"])
+        self._store_eval_metrics(extra, "acc_deploy", deploy_metrics)
+        extra["acc_deploy_source"] = deploy_acc_source
+
         lat_agg = self._latency_aggregate(latency_ms)
         extra["latency_agg_ms"] = float(lat_agg)
-        extra["scalar_score"] = self._scalarize(acc, lat_agg, size_bytes)
+        extra["scalar_score"] = self._scalarize(deploy_acc, lat_agg, size_bytes)
         extra["exclude_from_pareto"] = True
 
         metrics = Metrics(
-            acc=float(acc),
+            acc=float(deploy_acc),
             size_bytes=int(size_bytes),
             latency_ms=latency_ms,
+            precision=deploy_metrics.get("precision"),
+            recall=deploy_metrics.get("recall"),
+            iou=deploy_metrics.get("iou"),
+            map50=deploy_metrics.get("map50"),
         )
         return HistoryItem(
             candidate=cand,
@@ -470,6 +908,90 @@ class XTrimOrchestrator:
 
         return latency_ms
 
+    def _bench_devices_with_android_tflite(self, tflite_model: Path, run_dir: Path, *, delegate: str) -> Dict[str, float]:
+        latency_ms: Dict[str, float] = {}
+        if not self.devices:
+            return latency_ms
+
+        logs_dir = run_dir / "android_tflite_logs"
+        ensure_dir(logs_dir)
+
+        dataset_subset: Optional[AndroidDatasetSubset] = None
+        if self.ort_android_bench_cfg.push_dataset_images:
+            dataset_subset = self._prepare_android_dataset_subset(
+                run_dir=run_dir,
+                backend_name="android_tflite",
+                split=self.ort_android_bench_cfg.dataset_split,
+                max_images=self.ort_android_bench_cfg.dataset_max_images,
+                seed=self.ort_android_bench_cfg.dataset_seed,
+                remote_dir=self.ort_android_bench_cfg.remote_dir,
+                remote_subdir=self.ort_android_bench_cfg.dataset_remote_subdir,
+            )
+            (logs_dir / "dataset_subset.json").write_text(
+                json.dumps(dataclasses.asdict(dataset_subset), ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+        dataset_key = self._android_dataset_cache_suffix(
+            enabled=bool(self.ort_android_bench_cfg.push_dataset_images),
+            data_yaml=self.dataset_yaml,
+            split=self.ort_android_bench_cfg.dataset_split,
+            max_images=self.ort_android_bench_cfg.dataset_max_images,
+            seed=self.ort_android_bench_cfg.dataset_seed,
+        )
+
+        tflite_runner = AndroidTfliteBench(self.tools, self.ort_android_bench_cfg, delegate=delegate)
+        for d in self.devices:
+            model_hash = self._hash_file_model(tflite_model)
+            key = "|".join([
+                "tflite_android",
+                f"serial={d.serial}",
+                f"threads={d.threads}",
+                f"imgsz={self.ort_android_bench_cfg.imgsz}",
+                f"delegate={delegate}",
+                dataset_key,
+                f"model={model_hash}",
+            ])
+
+            if self.latency_cfg.use_cache and (not self.latency_cfg.force_rebench):
+                hit = self.cache.get(key)
+                if hit is not None:
+                    latency_ms[d.name] = float(hit.avg_ms)
+                    (logs_dir / f"{d.name}.cache.txt").write_text(
+                        f"cache_hit avg_ms={hit.avg_ms} ts={hit.ts}\nkey={key}\n",
+                        encoding="utf-8",
+                    )
+                    continue
+
+            run_kwargs = {}
+            if dataset_subset is not None:
+                run_kwargs = dict(
+                    local_images_dir=dataset_subset.local_dir,
+                    local_image_list=dataset_subset.local_list,
+                    remote_images_dir=dataset_subset.remote_dir,
+                    remote_image_list=dataset_subset.remote_list,
+                    dataset_image_count=dataset_subset.count,
+                )
+
+            data = tflite_runner.run_once(device=d, local_tflite=tflite_model, **run_kwargs)
+
+            avg_ms = None
+            for k in ("avg_ms", "latency_ms", "mean_ms"):
+                if k in data:
+                    avg_ms = float(data[k])
+                    break
+            if avg_ms is None:
+                raise RuntimeError(f"TFLite bench returned no avg latency field: {data}")
+
+            latency_ms[d.name] = avg_ms
+            self.cache.set(key, avg_ms)
+            (logs_dir / f"{d.name}.json").write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+        return latency_ms
+
     def _bench_latency(
         self,
         ncnn_param: Optional[Path],
@@ -489,6 +1011,203 @@ class XTrimOrchestrator:
         if ncnn_param is None or ncnn_bin is None:
             raise RuntimeError("NCNN model is required for this backend")
         return self._bench_devices_with_cache(ncnn_param, ncnn_bin, run_dir)
+
+    def _select_tflite_profile_model(self, profile: BenchmarkProfileConfig, tflite_models: Optional[Dict[str, Path]]) -> Path:
+        artifact = self._profile_artifact(profile).lower().strip()
+        models = dict(tflite_models or {})
+
+        aliases = {
+            "": "int8",
+            "int8": "int8",
+            "tflite_int8": "int8",
+            "model_int8": "int8",
+            "full_integer": "int8",
+            "full_integer_quant": "int8",
+            "integer_quant": "int8",
+            "fp16": "fp16",
+            "float16": "fp16",
+            "tflite_fp16": "fp16",
+            "model_fp16": "fp16",
+        }
+        key = aliases.get(artifact, artifact)
+        if key in models and Path(models[key]).exists():
+            return Path(models[key])
+
+        # Explicit path support for quick manual experiments.
+        if artifact:
+            p = Path(self._profile_artifact(profile))
+            if p.exists():
+                return p
+
+        available = ", ".join(f"{k}={v}" for k, v in sorted(models.items())) or "none"
+        raise RuntimeError(f"TFLite artifact {self._profile_artifact(profile)!r} is not available. Available: {available}")
+
+    def _bench_latency_profile(
+        self,
+        profile: BenchmarkProfileConfig,
+        index: int,
+        *,
+        ncnn_param: Optional[Path],
+        ncnn_bin: Optional[Path],
+        onnx_model: Optional[Path],
+        tflite_models: Optional[Dict[str, Path]] = None,
+        run_dir: Path,
+    ) -> Dict[str, float]:
+        backend = self._profile_backend(profile)
+        devices = self._devices_for_profile(profile)
+        if not devices:
+            raise RuntimeError(f"benchmark profile '{profile.name}' has no matching ready devices")
+
+        profile_name = self._profile_display_name(profile, index)
+        profile_dir = run_dir / "benchmark_profiles" / self._profile_log_name(profile_name)
+        ensure_dir(profile_dir)
+
+        old_devices = self.devices
+        old_ort_cfg = self.ort_android_bench_cfg
+        old_ort = self.android_ort
+        old_app_cfg = self.android_app_bench_cfg
+        old_app = self.android_app
+        old_export_cfg = self.export_cfg
+        old_latency_cfg = self.latency_cfg
+
+        try:
+            self.devices = devices
+            self.latency_cfg = dataclasses.replace(self.latency_cfg, backend=backend)
+
+            if backend == "ort_android":
+                if onnx_model is None:
+                    raise RuntimeError("onnx_model is required for backend=ort_android benchmark profile")
+                cfg = self._ort_cfg_for_profile(profile)
+                self.ort_android_bench_cfg = cfg
+                self.android_ort = AndroidOrtBench(self.tools, cfg)
+                return self._bench_devices_with_android_ort(onnx_model, profile_dir)
+
+            if backend == "android_app":
+                if ncnn_param is None or ncnn_bin is None:
+                    raise RuntimeError("NCNN model is required for backend=android_app benchmark profile")
+                cfg = self._android_app_cfg_for_profile(profile)
+                self.android_app_bench_cfg = cfg
+                self.android_app = AndroidAppBench(self.tools, cfg)
+                return self._bench_devices_with_android_app(ncnn_param, ncnn_bin, profile_dir)
+
+            if backend in {"tflite_android", "tflite"}:
+                tflite_model = self._select_tflite_profile_model(profile, tflite_models)
+                cfg = self._tflite_cfg_for_profile(profile)
+                self.ort_android_bench_cfg = cfg
+                delegate = self._profile_tflite_delegate(profile)
+                return self._bench_devices_with_android_tflite(tflite_model, profile_dir, delegate=delegate)
+
+            if backend == "benchncnn":
+                if ncnn_param is None or ncnn_bin is None:
+                    raise RuntimeError("NCNN model is required for backend=benchncnn benchmark profile")
+                if profile.shape:
+                    self.export_cfg = dataclasses.replace(self.export_cfg, bench_shape=str(profile.shape))
+                return self._bench_devices_with_cache(ncnn_param, ncnn_bin, profile_dir)
+
+            raise RuntimeError(f"Unsupported benchmark profile backend: {profile.backend!r}")
+        finally:
+            self.devices = old_devices
+            self.ort_android_bench_cfg = old_ort_cfg
+            self.android_ort = old_ort
+            self.android_app_bench_cfg = old_app_cfg
+            self.android_app = old_app
+            self.export_cfg = old_export_cfg
+            self.latency_cfg = old_latency_cfg
+
+    def _bench_latency_with_profiles(
+        self,
+        *,
+        ncnn_param: Optional[Path],
+        ncnn_bin: Optional[Path],
+        onnx_model: Optional[Path],
+        tflite_models: Optional[Dict[str, Path]] = None,
+        run_dir: Path,
+    ) -> tuple[Dict[str, float], Dict[str, Any]]:
+        profiles = self._active_benchmark_profiles()
+        if not profiles:
+            legacy = self._bench_latency(ncnn_param, ncnn_bin, run_dir, onnx_model=onnx_model)
+            return legacy, {}
+
+        latency_ms: Dict[str, float] = {}
+        details: Dict[str, Any] = {}
+        for i, profile in enumerate(profiles):
+            profile_name = self._profile_display_name(profile, i)
+            backend = self._profile_backend(profile)
+            try:
+                raw = self._bench_latency_profile(
+                    profile,
+                    i,
+                    ncnn_param=ncnn_param,
+                    ncnn_bin=ncnn_bin,
+                    onnx_model=onnx_model,
+                    tflite_models=tflite_models,
+                    run_dir=run_dir,
+                )
+                prefixed: Dict[str, float] = {}
+                for device_name, value in raw.items():
+                    key = f"{profile_name}/{device_name}"
+                    latency_ms[key] = float(value)
+                    prefixed[str(device_name)] = float(value)
+                details[profile_name] = {
+                    "backend": backend,
+                    "provider": profile.provider,
+                    "delegate": getattr(profile, "delegate", None),
+                    "artifact": getattr(profile, "artifact", None),
+                    "devices": [d.name for d in self._devices_for_profile(profile)],
+                    "latency_ms": prefixed,
+                    "required": bool(profile.required),
+                }
+            except Exception as e:
+                details[profile_name] = {
+                    "backend": backend,
+                    "provider": profile.provider,
+                    "delegate": getattr(profile, "delegate", None),
+                    "artifact": getattr(profile, "artifact", None),
+                    "failed": True,
+                    "error": str(e),
+                    "required": bool(profile.required),
+                }
+                if bool(profile.required):
+                    raise
+
+        if not latency_ms:
+            raise RuntimeError("No benchmark profile produced latency results")
+        return latency_ms, details
+
+    def _benchmark_existing_deploy_model(
+        self,
+        *,
+        ncnn_param: Optional[Path] = None,
+        ncnn_bin: Optional[Path] = None,
+        onnx_model: Optional[Path] = None,
+        tflite_models: Optional[Dict[str, Path]] = None,
+        run_dir: Path,
+    ) -> tuple[Dict[str, float], Dict[str, Any], str]:
+        """Benchmark an already exported deploy artifact without rebuilding it."""
+        ensure_dir(run_dir)
+        backend = str(self.latency_cfg.backend).lower().strip()
+        profiles_active = bool(self._active_benchmark_profiles())
+
+        if profiles_active:
+            latency_ms, profile_details = self._bench_latency_with_profiles(
+                ncnn_param=ncnn_param,
+                ncnn_bin=ncnn_bin,
+                onnx_model=onnx_model,
+                tflite_models=tflite_models,
+                run_dir=run_dir,
+            )
+            return latency_ms, {"benchmark_profiles": profile_details}, "multi_profile"
+
+        if backend == "ort_android":
+            if onnx_model is None:
+                raise RuntimeError("ONNX model is required for backend=ort_android rebench")
+            latency_ms = self._bench_latency(None, None, run_dir, onnx_model=onnx_model)
+            return latency_ms, {}, "ort_android"
+
+        if ncnn_param is None or ncnn_bin is None:
+            raise RuntimeError(f"NCNN .param/.bin model is required for backend={backend!r} rebench")
+        latency_ms = self._bench_latency(ncnn_param, ncnn_bin, run_dir, onnx_model=onnx_model)
+        return latency_ms, {}, "ncnn"
 
     def _bench_devices_with_android_app(self, ncnn_param: Path, ncnn_bin: Path, run_dir: Path) -> Dict[str, float]:
         latency_ms: Dict[str, float] = {}
@@ -609,10 +1328,11 @@ class XTrimOrchestrator:
         return latency_ms
 
     def _maybe_eval_onnx(self, onnx_path: Path, extra: Dict[str, Any], key: str) -> None:
-        if self.eval_exported_onnx_fn is None:
+        if self.eval_exported_onnx_fn is None and self.eval_exported_onnx_metrics_fn is None:
             return
         try:
-            extra[key] = float(self.eval_exported_onnx_fn(onnx_path))
+            metrics = self._eval_exported_onnx_metrics(onnx_path)
+            self._store_eval_metrics(extra, key, metrics)
         except Exception as e:
             extra[f"{key}_skipped"] = str(e)
 
@@ -630,16 +1350,84 @@ class XTrimOrchestrator:
             extra[f"onnx_ptq_{tag}_failed"] = str(e)
             return None
 
-        if self.eval_exported_onnx_fn is not None:
+        if self.eval_exported_onnx_fn is not None or self.eval_exported_onnx_metrics_fn is not None:
             try:
-                acc_int8 = float(self.eval_exported_onnx_fn(p))
+                metrics_int8 = self._eval_exported_onnx_metrics(p)
                 if tag == "before_qat":
-                    extra["acc_onnx_int8"] = acc_int8
+                    self._store_eval_metrics(extra, "acc_onnx_int8", metrics_int8)
                 elif tag == "after_qat":
-                    extra["acc_onnx_int8_after_qat"] = acc_int8
+                    self._store_eval_metrics(extra, "acc_onnx_int8_after_qat", metrics_int8)
             except Exception as e:
                 extra[f"acc_onnx_int8_{tag}_skipped"] = str(e)
         return p
+
+    def _collect_tflite_artifacts(self, run_dir: Path) -> Dict[str, Path]:
+        out: Dict[str, Path] = {}
+        tdir = run_dir / "export" / "tflite"
+        int8_name = str(getattr(self.export_cfg, "tflite_int8_name", "model_int8.tflite") or "model_int8.tflite")
+        fp16_name = str(getattr(self.export_cfg, "tflite_fp16_name", "model_fp16.tflite") or "model_fp16.tflite")
+        candidates = {
+            "int8": tdir / int8_name,
+            "tflite_int8": tdir / int8_name,
+            "fp16": tdir / fp16_name,
+            "tflite_fp16": tdir / fp16_name,
+        }
+        for key, path in candidates.items():
+            if path.exists():
+                out[key] = path
+        return out
+
+    def _store_tflite_artifacts(self, run_dir: Path, extra: Dict[str, Any]) -> Dict[str, Path]:
+        artifacts = self._collect_tflite_artifacts(run_dir)
+        if artifacts:
+            extra["tflite_artifacts"] = {k: str(v) for k, v in sorted(artifacts.items())}
+            sizes: Dict[str, int] = {}
+            for k, v in artifacts.items():
+                try:
+                    sizes[k] = int(sizeof_file(v))
+                except Exception:
+                    pass
+            if sizes:
+                extra["tflite_artifact_size_bytes"] = sizes
+        return artifacts
+
+    def _tflite_int8_enabled(self) -> bool:
+        return bool(getattr(self.export_cfg, "tflite", False)) and bool(getattr(self.export_cfg, "tflite_int8", False))
+
+    def _maybe_export_tflite_int8(self, student: Any, run_dir: Path, extra: Dict[str, Any]) -> Optional[Path]:
+        """Create an additional TFLite INT8 artifact without changing ONNX deploy selection."""
+        if not self._tflite_int8_enabled():
+            return None
+        if self.export_tflite_int8_fn_factory is None:
+            msg = "export_tflite_int8_fn_factory is None"
+            extra["tflite_int8_export"] = "skipped"
+            extra["tflite_int8_skipped"] = msg
+            if bool(getattr(self.export_cfg, "tflite_int8_required", False)):
+                raise RuntimeError(msg)
+            return None
+
+        tflite_name = str(getattr(self.export_cfg, "tflite_int8_name", "model_int8.tflite") or "model_int8.tflite")
+        out = run_dir / "export" / "tflite" / tflite_name
+        try:
+            export_fn = self.export_tflite_int8_fn_factory(student, self.export_cfg)
+            p = Path(export_fn(out))
+            if not p.exists():
+                raise RuntimeError(f"TFLite INT8 export did not create file: {p}")
+            extra["tflite_int8_export"] = "ok"
+            extra["tflite_int8_path"] = str(p)
+            extra["tflite_int8_size_bytes"] = int(sizeof_file(p))
+            # The same Ultralytics/onnx2tf export can also produce a stable
+            # model_fp16.tflite when export.tflite_fp16=true.  Record every
+            # copied artifact so benchmark_profiles can select them later.
+            self._store_tflite_artifacts(run_dir, extra)
+            return p
+        except Exception as exc:
+            extra["tflite_int8_export"] = "failed"
+            extra["tflite_int8_failed"] = str(exc)
+            if bool(getattr(self.export_cfg, "tflite_int8_required", False)):
+                raise
+            print(f"[warn] TFLite INT8 export failed: {exc}", file=sys.stderr)
+            return None
 
     def _prune_mode(self) -> str:
         mode = str(getattr(self.trim_cfg, "prune_mode", "one_shot") or "one_shot").strip().lower()
@@ -886,9 +1674,11 @@ class XTrimOrchestrator:
                         target_architecture=stage_target_arch,
                     )
 
+            stage_metrics_before: Optional[Dict[str, float]] = None
             stage_acc_before: Optional[float] = None
             if eval_each_stage:
-                stage_acc_before = float(self.eval_acc_fn(student))
+                stage_metrics_before = self._eval_student_metrics(student)
+                stage_acc_before = float(stage_metrics_before["map50_95"])
 
             stage_train_cfg = self._stage_train_cfg(is_final=is_final)
             stage_logs = self.finetune_fn(student, stage_train_cfg)
@@ -906,14 +1696,18 @@ class XTrimOrchestrator:
                 stage_rec["target_architecture"] = stage_target_arch
             if stage_acc_before is not None:
                 stage_rec["acc_before_recovery"] = stage_acc_before
+            if stage_metrics_before is not None:
+                self._store_stage_metrics(stage_rec, "before_recovery", stage_metrics_before)
             if stage_trim_stats is not None:
                 stage_rec["trim_stats"] = stage_trim_stats
             if isinstance(stage_logs, dict):
                 stage_rec["finetune_logs"] = stage_logs
 
             if eval_each_stage:
-                stage_acc = float(self.eval_acc_fn(student))
+                stage_metrics_after = self._eval_student_metrics(student)
+                stage_acc = float(stage_metrics_after["map50_95"])
                 stage_rec["acc_after_recovery"] = stage_acc
+                self._store_stage_metrics(stage_rec, "after_recovery", stage_metrics_after)
                 if is_final:
                     final_acc = stage_acc
 
@@ -946,8 +1740,14 @@ class XTrimOrchestrator:
         extra: Dict[str, Any] = {}
         student, precomputed_acc = self._build_and_recover_student(cand, extra)
 
-        acc = float(precomputed_acc) if precomputed_acc is not None else float(self.eval_acc_fn(student))
+        if self.eval_metrics_fn is not None:
+            recovered_metrics = self._eval_student_metrics(student)
+        else:
+            recovered_acc = float(precomputed_acc) if precomputed_acc is not None else float(self.eval_acc_fn(student))
+            recovered_metrics = {"map50_95": recovered_acc}
+        acc = float(recovered_metrics["map50_95"])
         extra["acc_kind"] = "mAP50-95"
+        self._store_eval_metrics(extra, "acc_recovered_torch", recovered_metrics)
 
         try:
             from .trim.gumbel_choice import count_mixed_ops, freeze_mixed_ops
@@ -1046,67 +1846,81 @@ class XTrimOrchestrator:
         # at the pre-QAT FP32 recovery score, while size/latency could belong
         # to model_int8_after_qat.onnx. That made FINAL RESULTS and Pareto
         # compare different deploy artifacts.
-        deploy_acc = float(acc)
-        deploy_acc_source = "recovered_torch"
+        deploy_acc_source = "acc_recovered_torch"
         if deploy_onnx_kind == "int8_after_qat" and "acc_onnx_int8_after_qat" in extra:
-            deploy_acc = float(extra["acc_onnx_int8_after_qat"])
             deploy_acc_source = "acc_onnx_int8_after_qat"
         elif deploy_onnx_kind == "qat_fp32" and "acc_onnx_after_qat" in extra:
-            deploy_acc = float(extra["acc_onnx_after_qat"])
             deploy_acc_source = "acc_onnx_after_qat"
         elif deploy_onnx_kind == "int8_before_qat" and "acc_onnx_int8" in extra:
-            deploy_acc = float(extra["acc_onnx_int8"])
             deploy_acc_source = "acc_onnx_int8"
         elif deploy_onnx_kind == "fp32" and "acc_onnx" in extra:
-            deploy_acc = float(extra["acc_onnx"])
             deploy_acc_source = "acc_onnx"
 
-        extra["acc_recovered_torch"] = float(acc)
-        extra["acc_deploy"] = float(deploy_acc)
+        deploy_metrics = self._metrics_from_extra(extra, deploy_acc_source)
+        if "map50_95" not in deploy_metrics:
+            deploy_metrics = {"map50_95": float(acc)}
+        deploy_acc = float(deploy_metrics["map50_95"])
+        self._store_eval_metrics(extra, "acc_deploy", deploy_metrics)
         extra["acc_deploy_source"] = deploy_acc_source
 
-        size_bytes = int(sizeof_file(onnx_path))
+        tflite_int8 = self._maybe_export_tflite_int8(student, run_dir, extra)
+        tflite_models = self._store_tflite_artifacts(run_dir, extra)
+
+        size_bytes = int(sizeof_file(deploy_onnx))
         latency_ms: Dict[str, float] = {}
 
         backend = str(self.latency_cfg.backend).lower().strip()
+        profiles_active = bool(self._active_benchmark_profiles())
+        needs_ncnn = self._needs_ncnn_artifact()
         ncnn_final = None
 
-        if backend == "ort_android":
-            size_bytes = int(sizeof_file(deploy_onnx))
+        if needs_ncnn:
+            source_onnx, source_label = self._select_ncnn_source_onnx(
+                onnx_fp32=onnx_path,
+                onnx_qat=onnx_qat,
+                deploy_onnx=deploy_onnx,
+                deploy_onnx_kind=deploy_onnx_kind,
+            )
+            (run_dir / "convert_backend.txt").write_text(f"onnx2ncnn ({source_label})", encoding="utf-8")
+            ncnn_final = self._prepare_ncnn_from_onnx(
+                source_onnx=source_onnx,
+                ncnn_dir=run_dir / "ncnn",
+                extra=extra,
+                source_label=source_label,
+                pnnx_ncnn=_pnnx_ncnn if source_onnx == onnx_path else None,
+            )
+
+        onnx_size_bytes = int(sizeof_file(deploy_onnx))
+        ncnn_size_bytes = int(sizeof_file(ncnn_final.param) + sizeof_file(ncnn_final.bin)) if ncnn_final is not None else None
+        tflite_int8_size_bytes = int(sizeof_file(tflite_int8)) if tflite_int8 is not None else None
+        extra["deploy_size_bytes_by_backend"] = {
+            "onnx": onnx_size_bytes,
+            **({"ncnn": ncnn_size_bytes} if ncnn_size_bytes is not None else {}),
+            **({"tflite_int8": tflite_int8_size_bytes} if tflite_int8_size_bytes is not None else {}),
+        }
+
+        if profiles_active:
+            latency_ms, profile_details = self._bench_latency_with_profiles(
+                ncnn_param=ncnn_final.param if ncnn_final is not None else None,
+                ncnn_bin=ncnn_final.bin if ncnn_final is not None else None,
+                onnx_model=deploy_onnx,
+                tflite_models=tflite_models,
+                run_dir=run_dir,
+            )
+            extra["benchmark_profiles"] = profile_details
+            extra["deploy_backend"] = "multi_profile"
+            extra["primary_latency_backend"] = backend
+            size_bytes = ncnn_size_bytes if backend != "ort_android" and ncnn_size_bytes is not None else onnx_size_bytes
+        elif backend == "ort_android":
+            size_bytes = onnx_size_bytes
             latency_ms = self._bench_latency(None, None, run_dir, onnx_model=deploy_onnx)
             extra["deploy_backend"] = "ort_android"
         else:
-            ncnn_dir = run_dir / "ncnn"
-            ensure_dir(ncnn_dir)
-
-            ncnn_float = None
-            if _pnnx_ncnn is not None:
-                ncnn_float = _pnnx_ncnn
-                extra["ncnn_source"] = "pnnx"
-                (run_dir / "convert_backend.txt").write_text("pnnx", encoding="utf-8")
-            else:
-                extra["ncnn_source"] = "onnx_fp32"
-                try:
-                    ncnn_float = self.converter.onnx_to_ncnn(onnx_path, ncnn_dir / "float")
-                    (run_dir / "convert_backend.txt").write_text("onnx2ncnn (onnx_fp32)", encoding="utf-8")
-                except Exception as e:
-                    extra["ncnn_convert_skipped"] = str(e)
-                    (run_dir / "convert_backend.txt").write_text("", encoding="utf-8")
-
-            if ncnn_float is not None:
-                ncnn_opt = self.converter.optimize(ncnn_float, ncnn_dir / "opt")
-                ncnn_final = ncnn_opt
-                if self.ptq_cfg.enabled:
-                    auto_calib = run_dir / "ptq" / "calib_images.txt"
-                    ptq_cfg_resolved = self.ptq_cfg
-                    if auto_calib.exists():
-                        ptq_cfg_resolved = dataclasses.replace(self.ptq_cfg, imagelist=str(auto_calib))
-                    ncnn_final = self.converter.ptq_int8(ncnn_opt, ncnn_dir / "int8", ptq_cfg_resolved)
-                    extra["ncnn_source"] = "ncnn_int8"
-
-                size_bytes = int(sizeof_file(ncnn_final.param) + sizeof_file(ncnn_final.bin))
-                latency_ms = self._bench_latency(ncnn_final.param, ncnn_final.bin, run_dir)
-                extra["deploy_backend"] = "ncnn"
+            if ncnn_final is None:
+                raise RuntimeError("NCNN model was not prepared for NCNN latency backend")
+            size_bytes = int(ncnn_size_bytes)
+            latency_ms = self._bench_latency(ncnn_final.param, ncnn_final.bin, run_dir)
+            extra["deploy_backend"] = "ncnn"
 
         if self.android_demo_cfg.enabled and ncnn_final is not None:
             try:
@@ -1130,7 +1944,15 @@ class XTrimOrchestrator:
         extra["scalar_score"] = self._scalarize(deploy_acc, lat_agg, size_bytes)
         extra["latency_aggregate_mode"] = self.latency_cfg.aggregate
 
-        metrics = Metrics(acc=float(deploy_acc), size_bytes=int(size_bytes), latency_ms=latency_ms)
+        metrics = Metrics(
+            acc=float(deploy_acc),
+            size_bytes=int(size_bytes),
+            latency_ms=latency_ms,
+            precision=deploy_metrics.get("precision"),
+            recall=deploy_metrics.get("recall"),
+            iou=deploy_metrics.get("iou"),
+            map50=deploy_metrics.get("map50"),
+        )
         return HistoryItem(candidate=cand, metrics=metrics, artifacts_dir=str(run_dir), extra=extra)
 
     def _archive_history(self) -> None:

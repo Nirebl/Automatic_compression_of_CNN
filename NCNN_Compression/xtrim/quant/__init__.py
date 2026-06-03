@@ -3,6 +3,7 @@ from .fake_quant_ultra import (
     patch_ultralytics_convs_for_fake_quant,
     set_fake_quant_enabled,
     set_fake_quant_bits,
+    unpatch_ultralytics_convs_for_fake_quant,
 )
 
 
@@ -19,4 +20,5 @@ __all__ = [
     "patch_ultralytics_convs_for_fake_quant",
     "set_fake_quant_enabled",
     "set_fake_quant_bits",
+    "unpatch_ultralytics_convs_for_fake_quant",
 ]

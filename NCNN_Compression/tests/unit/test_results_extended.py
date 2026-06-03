@@ -84,3 +84,96 @@ def test_plot_pareto_handles_missing_matplotlib(monkeypatch, make_history_item, 
 
 def test_load_history_missing_returns_empty(tmp_path):
     assert load_history_jsonl(tmp_path / "missing.jsonl") == []
+
+
+def test_results_table_shows_stage_metrics_and_final_deploy_map(make_history_item, capsys):
+    ref = make_history_item(
+        tag="baseline_raw",
+        acc=0.6193,
+        size=83_600_000,
+        latency={"phone": 868.2},
+        baseline=True,
+        extra={
+            "deploy_onnx_kind": "fp32_raw_baseline",
+            "precision_deploy": 0.7012,
+            "recall_deploy": 0.6899,
+            "iou_deploy": 0.7634,
+        },
+    )
+    cand = make_history_item(
+        tag="w1.0_p0.84_r0_s0.0",
+        acc=0.5416,
+        size=5_500_000,
+        latency={
+            "cpu_ort_xnnpack/phone_cpu": 235.4,
+            "ncnn_android/phone_ncnn": 210.7,
+            "npu_nnapi/phone_npu": 180.2,
+        },
+        prune=0.84,
+        extra={
+            "acc_recovered_torch": 0.5416,
+            "acc_onnx": 0.4391,
+            "acc_onnx_int8": 0.4017,
+            "acc_onnx_after_qat": 0.5500,
+            "acc_onnx_int8_after_qat": 0.5416,
+            "acc_deploy": 0.5416,
+            "precision_deploy": 0.6123,
+            "recall_deploy": 0.7345,
+            "iou_deploy": 0.7456,
+            "map50_deploy": 0.8123,
+            "deploy_onnx_kind": "int8_after_qat",
+        },
+    )
+
+    print_results_table([ref, cand])
+    out = capsys.readouterr().out
+
+    assert "Torch" in out
+    assert "ONNX" in out
+    assert "PTQ" in out
+    assert "QAT INT8" in out
+    assert "Final" in out
+    assert "Init Prec" in out
+    assert "Init Rec" in out
+    assert "Prec" in out
+    assert "Recall" in out
+    assert "Init IoU" in out
+    assert "IoU" in out
+    assert "mAP50" not in out
+    assert "Lat CPU" in out
+    assert "Lat NCNN" in out
+    assert "Lat NPU" in out
+    assert "Deploy" in out
+    assert "0.4391" in out
+    assert "0.4017" in out
+    assert "0.5500" in out
+    assert "0.5416" in out
+    assert "0.7012" in out
+    assert "0.6899" in out
+    assert "0.6123" in out
+    assert "0.7345" in out
+    assert "0.7634" in out
+    assert "0.7456" in out
+    assert "0.8123" not in out
+    assert "QAT INT8" in out
+    assert "selected deploy artifact" in out
+
+    print_results_table([ref, cand], hide_extra=True)
+    out = capsys.readouterr().out
+    assert "Init Prec" not in out
+    assert "Init Rec" not in out
+    assert "Prec" not in out
+    assert "Recall" not in out
+    assert "Init IoU" not in out
+    assert "IoU" not in out
+    assert "mAP50" not in out
+    assert "Lat CPU" not in out
+    assert "Lat NCNN" not in out
+    assert "Lat NPU" not in out
+    assert "0.7012" not in out
+    assert "0.6899" not in out
+    assert "0.6123" not in out
+    assert "0.7345" not in out
+    assert "0.7634" not in out
+    assert "0.7456" not in out
+    assert "0.8123" not in out

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 
-from xtrim.types import AndroidDemoConfig, DeviceConfig, LatencyConfig, NcnnModelPaths, OnnxPTQConfig, PTQConfig
+from xtrim.types import AndroidDemoConfig, BenchmarkProfileConfig, DeviceConfig, LatencyConfig, NcnnModelPaths, OnnxPTQConfig, PTQConfig
 
 pytestmark = pytest.mark.integration
 
@@ -119,3 +119,57 @@ def test_run_filters_unready_devices_and_records_failed_candidate(make_orchestra
     assert [d.name for d in orch.devices] == ["ready"]
     assert history[-1].extra["failed"] is True
     assert (Path(history[-1].artifacts_dir) / "error.txt").exists()
+
+
+def test_multi_benchmark_profiles_prefix_latency_and_store_details(tmp_path, make_orchestrator, monkeypatch):
+    d1 = DeviceConfig(name="phone_cpu", serial="s1")
+    d2 = DeviceConfig(name="phone_npu", serial="s2")
+    orch = make_orchestrator(
+        devices=[d1, d2],
+        latency_cfg=LatencyConfig(backend="ort_android", use_cache=False),
+    )
+    orch.benchmark_profiles = [
+        BenchmarkProfileConfig(
+            name="ort_cpu",
+            backend="ort_android",
+            provider="xnnpack",
+            device_names=("phone_cpu",),
+            threads=4,
+        ),
+        BenchmarkProfileConfig(
+            name="ncnn_app",
+            backend="android_app",
+            device_names=("phone_npu",),
+            threads=2,
+        ),
+    ]
+    onnx = tmp_path / "m.onnx"
+    onnx.write_bytes(b"onnx")
+    pair = _write_ncnn_pair(tmp_path, "profile")
+
+    def fake_ort(onnx_model, run_dir):
+        assert orch.ort_android_bench_cfg.provider == "xnnpack"
+        assert [d.name for d in orch.devices] == ["phone_cpu"]
+        assert orch.devices[0].threads == 4
+        return {"phone_cpu": 10.0}
+
+    def fake_app(param, binf, run_dir):
+        assert orch.android_app_bench_cfg.threads == 2
+        assert [d.name for d in orch.devices] == ["phone_npu"]
+        return {"phone_npu": 20.0}
+
+    monkeypatch.setattr(orch, "_bench_devices_with_android_ort", fake_ort)
+    monkeypatch.setattr(orch, "_bench_devices_with_android_app", fake_app)
+
+    latency, details = orch._bench_latency_with_profiles(
+        ncnn_param=pair.param,
+        ncnn_bin=pair.bin,
+        onnx_model=onnx,
+        run_dir=tmp_path / "run",
+    )
+
+    assert latency == {"ort_cpu/phone_cpu": 10.0, "ncnn_app/phone_npu": 20.0}
+    assert details["ort_cpu"]["backend"] == "ort_android"
+    assert details["ort_cpu"]["provider"] == "xnnpack"
+    assert details["ncnn_app"]["latency_ms"] == {"phone_npu": 20.0}
+    assert [d.name for d in orch.devices] == ["phone_cpu", "phone_npu"]

@@ -8,13 +8,17 @@ from xtrim.config import load_yaml, parse_config
 from xtrim.orchestrator import XTrimOrchestrator
 from xtrim.pareto import avg_latency
 from xtrim.results_table import print_results_table
+from xtrim.rebench_existing import rebench_existing
 from xtrim.quant.calib import make_calib_imagelist
 from xtrim.quant.ort_ptq import ort_static_quantize_yolo
 from xtrim.yolo.ultralytics_io import (
     build_ultralytics_candidate,
     eval_ultralytics_map,
+    eval_ultralytics_metrics,
     eval_exported_onnx_map,
+    eval_exported_onnx_metrics,
     make_ultralytics_export_onnx_fn,
+    make_ultralytics_export_tflite_int8_fn,
     save_student_torchscript,
     warmstart_noop,
     finetune_noop,
@@ -40,6 +44,17 @@ def main() -> int:
     ap.add_argument("--config", type=str, required=True, help="Path to YAML config")
     ap.add_argument("--out", type=str, default="outputs/xtrim", help="Output root")
     ap.add_argument("--max_candidates", type=int, default=10)
+    ap.add_argument(
+        "--hide-extra",
+        action="store_true",
+        help="Hide auxiliary precision/recall/IoU and per-profile latency columns",
+    )
+    ap.add_argument(
+        "--rebench-existing",
+        type=str,
+        default=None,
+        help="Re-run Android latency benchmarks for already generated artifacts from this output directory",
+    )
     args = ap.parse_args()
 
     cfg = load_yaml(Path(args.config))
@@ -66,6 +81,7 @@ def main() -> int:
         lut_cfg,
         gumbel_cfg,
         lowrank_cfg,
+        benchmark_profiles,
         staged_pruning_cfg,
         dilated_cfg,
     ) = parse_config(cfg)
@@ -101,11 +117,20 @@ def main() -> int:
     def export_factory(student, export_cfg_):
         return make_ultralytics_export_onnx_fn(student, model_cfg, export_cfg_)
 
+    def export_tflite_int8_factory(student, export_cfg_):
+        return make_ultralytics_export_tflite_int8_fn(student, model_cfg, export_cfg_)
+
     def eval_student(student):
         return eval_ultralytics_map(student, model_cfg, eval_cfg)
 
+    def eval_student_metrics(student):
+        return eval_ultralytics_metrics(student, model_cfg, eval_cfg)
+
     def eval_onnx(onnx_path: Path) -> float:
         return eval_exported_onnx_map(onnx_path, model_cfg, eval_cfg)
+
+    def eval_onnx_metrics(onnx_path: Path):
+        return eval_exported_onnx_metrics(onnx_path, model_cfg, eval_cfg)
 
     if bool(train_cfg.kd_enabled) and bool(kd_cfg.enabled):
         def finetune_fn(student, stage_train_cfg):
@@ -175,18 +200,37 @@ def main() -> int:
         finetune_fn=finetune_fn,
         finetune_qat_fn=finetune_qat_fn,
         eval_acc_fn=eval_student,
+        eval_metrics_fn=eval_student_metrics,
         export_onnx_fn_factory=export_factory,
+        export_tflite_int8_fn_factory=export_tflite_int8_factory,
         eval_exported_onnx_fn=eval_onnx,
+        eval_exported_onnx_metrics_fn=eval_onnx_metrics,
         quantize_onnx_fn=quantize_onnx_fn,
         save_student_pt_fn=save_student_torchscript,
         android_app_bench_cfg=android_app_bench_cfg,
         ort_android_bench_cfg=ort_android_bench_cfg,
         dataset_yaml=model_cfg.data,
+        benchmark_profiles=benchmark_profiles,
     )
+
+    if args.rebench_existing:
+        history = rebench_existing(
+            orchestrator=orch,
+            source_run_dir=Path(args.rebench_existing),
+            out_root=Path(args.out),
+            cfg=cfg,
+            latency_cfg=latency_cfg,
+            devices=devices,
+            android_app_bench_cfg=android_app_bench_cfg,
+            ort_android_bench_cfg=ort_android_bench_cfg,
+            benchmark_profiles=benchmark_profiles,
+        )
+        print_results_table(history, title="REBENCH RESULTS", hide_extra=args.hide_extra)
+        return 0
 
     history = orch.run(max_candidates=args.max_candidates)
 
-    print_results_table(history, title="FINAL RESULTS")
+    print_results_table(history, title="FINAL RESULTS", hide_extra=args.hide_extra)
 
     return 0
 

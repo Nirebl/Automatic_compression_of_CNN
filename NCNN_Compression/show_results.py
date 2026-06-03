@@ -12,7 +12,7 @@ def main() -> int:
     ap.add_argument(
         "--history",
         type=str,
-        default="outputs/yolov8m_p08_staged_30_30_30_100ep/history.jsonl",
+        default="outputs/yolo8_30x_new_metrics_poco_gpu/history.jsonl",
         help="Path to history.jsonl",
     )
     ap.add_argument(
@@ -33,6 +33,11 @@ def main() -> int:
         metavar="FILE",
         help="Save Pareto plot to this file instead of displaying (e.g. pareto.png)",
     )
+    ap.add_argument(
+        "--hide-extra",
+        action="store_true",
+        help="Hide auxiliary precision/recall/IoU and per-profile latency columns",
+    )
     args = ap.parse_args()
 
     history = load_history_jsonl(Path(args.history))
@@ -40,7 +45,7 @@ def main() -> int:
         print(f"[show_results] No data found in: {args.history}")
         return 1
 
-    print_results_table(history, title=args.title)
+    print_results_table(history, title=args.title, hide_extra=args.hide_extra)
 
     if args.plot or args.plot_save:
         plot_pareto(history, title=args.title, save_path=args.plot_save)

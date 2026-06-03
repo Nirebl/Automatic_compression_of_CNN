@@ -172,6 +172,11 @@ class AndroidOrtBench:
                 if "run_id" in data and str(data["run_id"]) != run_id:
                     time.sleep(float(cfg.poll_interval_sec))
                     continue
+                data.setdefault("backend", "ort")
+                data.setdefault("provider", str(cfg.provider))
+                data.setdefault("runtime", f"ort_{cfg.provider}")
+                data.setdefault("device_name", device.name)
+                data.setdefault("serial", device.serial)
                 return data
 
             time.sleep(float(cfg.poll_interval_sec))

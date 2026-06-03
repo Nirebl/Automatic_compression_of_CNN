@@ -108,7 +108,13 @@ def _install_fake_ultralytics_runtime(monkeypatch):
             self.names = ["cat", "dog"]
             self.predictor = object()
         def val(self, **_kwargs):
-            return {"metrics/mAP50-95(B)": 0.77}
+            return {
+                "metrics/mAP50-95(B)": 0.77,
+                "metrics/precision(B)": 0.66,
+                "metrics/recall(B)": 0.55,
+                "metrics/IoU(B)": 0.77,
+                "metrics/mAP50(B)": 0.88,
+            }
 
     ultra = types.ModuleType("ultralytics")
     ultra.YOLO = YOLO
@@ -246,8 +252,18 @@ def test_ultralytics_io_finetune_eval_export_and_metadata(monkeypatch, tmp_path)
     assert uio._extract_map5095(types.SimpleNamespace(results_dict={"metrics/mAP50-95": 0.6})) == 0.6
     assert uio._extract_map5095(types.SimpleNamespace(box=types.SimpleNamespace(map=0.7))) == 0.7
     assert uio._extract_map5095(types.SimpleNamespace(maps=[0.2, 0.4])) == pytest.approx(0.3)
+    assert uio._extract_detection_metrics({
+        "metrics/mAP50-95(B)": 0.5,
+        "metrics/precision(B)": 0.4,
+        "metrics/recall(B)": 0.3,
+        "metrics/mAP50(B)": 0.6,
+        "metrics/IoU(B)": 0.45,
+    }) == {"map50_95": 0.5, "precision": 0.4, "recall": 0.3, "iou": 0.45, "map50": 0.6}
+    assert uio._extract_detection_metrics(types.SimpleNamespace(box=types.SimpleNamespace(map=0.7, mp=0.6, mr=0.5, iou=0.65, map50=0.8))) == {"map50_95": 0.7, "precision": 0.6, "recall": 0.5, "iou": 0.65, "map50": 0.8}
     assert uio.eval_ultralytics_map(student, ModelConfig(imgsz=8), EvalConfig()) == 0.77
     assert uio.eval_exported_onnx_map(tmp_path / "m.onnx", ModelConfig(imgsz=8), EvalConfig()) == 0.77
+    assert uio.eval_ultralytics_metrics(student, ModelConfig(imgsz=8), EvalConfig()) == {"map50_95": 0.77, "precision": 0.66, "recall": 0.55, "iou": 0.77, "map50": 0.88}
+    assert uio.eval_exported_onnx_metrics(tmp_path / "m.onnx", ModelConfig(imgsz=8), EvalConfig()) == {"map50_95": 0.77, "precision": 0.66, "recall": 0.55, "iou": 0.77, "map50": 0.88}
 
     export_calls = {"n": 0}
     def fake_export(_m, _args, path, **kwargs):

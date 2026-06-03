@@ -28,6 +28,7 @@ from .types import (
     LowRankConfig,
     DilatedConfig,
     OrtAndroidBenchConfig,
+    BenchmarkProfileConfig,
 )
 
 
@@ -58,6 +59,7 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     LatencyLUTConfig,
     GumbelChoiceConfig,
     LowRankConfig,
+    List[BenchmarkProfileConfig],
     StagedPruningConfig,
     DilatedConfig,
 ]:
@@ -93,6 +95,32 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
 
     ort_android_bench_cfg = OrtAndroidBenchConfig(**cfg.get("ort_android_bench", {}))
 
+    benchmark_profiles: List[BenchmarkProfileConfig] = []
+    for i, profile_raw in enumerate(cfg.get("benchmark_profiles", []) or []):
+        raw = dict(profile_raw or {})
+        # Historically benchmark_profiles used either devices: [...] or
+        # device: "phone1" to select Android devices by name/serial.
+        # New NCNN runtime selection should be done with runtime: ncnn_cpu|ncnn_vulkan
+        # or gpu_device. If device is numeric, keep it as an override field.
+        if "devices" in raw:
+            devices_value = raw.pop("devices")
+        elif "device_names" in raw:
+            devices_value = raw.pop("device_names")
+        elif "device" in raw and not isinstance(raw.get("device"), (int, float)):
+            devices_value = raw.pop("device")
+        else:
+            devices_value = ()
+        if devices_value is None or devices_value == "":
+            device_names = ()
+        elif isinstance(devices_value, str):
+            device_names = (devices_value,)
+        else:
+            device_names = tuple(devices_value)
+        raw["device_names"] = device_names
+        if not raw.get("name"):
+            raw["name"] = str(raw.get("backend") or f"profile_{i + 1}")
+        benchmark_profiles.append(BenchmarkProfileConfig(**raw))
+
     dilated_raw = dict(cfg.get("dilated", {}))
     if "rates" in dilated_raw:
         dilated_raw["rates"] = tuple(dilated_raw["rates"])
@@ -123,6 +151,7 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
         lut_cfg,
         gumbel_cfg,
         lowrank_cfg,
+        benchmark_profiles,
         staged_pruning_cfg,
         dilated_cfg,
     )

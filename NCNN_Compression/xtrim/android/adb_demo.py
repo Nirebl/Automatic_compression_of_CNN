@@ -7,6 +7,7 @@ from typing import Optional
 from PIL import Image
 
 from ..types import DeviceConfig, ToolsConfig, AndroidDemoConfig
+from ..runtime_backend import resolve_ncnn_runtime
 from ..utils import ensure_dir
 
 
@@ -85,11 +86,14 @@ class AdbYoloDemo:
         self.adb(device.serial, "push", str(ncnn_bin), "/data/local/tmp/model.bin")
         self.adb(device.serial, "push", str(ppm_path), "/data/local/tmp/input.ppm")
 
+        runtime = resolve_ncnn_runtime(device)
         cmd = (
             "cd /data/local/tmp && "
             "./xtrim_yolo_detect "
             f"--param model.param --bin model.bin "
             f"--image input.ppm "
+            f"--runtime {runtime} "
+            f"--threads {int(device.threads)} "
             f"--imgsz {int(demo_cfg.imgsz)} "
             f"--conf {float(demo_cfg.conf)} "
             f"--iou {float(demo_cfg.iou)} "

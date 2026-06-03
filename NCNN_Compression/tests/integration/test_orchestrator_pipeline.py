@@ -73,3 +73,28 @@ def test_orchestrator_resume_does_not_duplicate_reference_baseline(make_orchestr
 
     assert len(second) == 1
     assert second[0].candidate.tag == "baseline_raw"
+
+
+def test_orchestrator_exports_optional_tflite_int8_artifact(make_orchestrator):
+    from xtrim.types import ExportConfig
+
+    def tflite_factory(_student, _cfg):
+        def _export(path: Path) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fake-tflite-int8")
+            return path
+        return _export
+
+    orch = make_orchestrator(
+        export_tflite_int8_fn_factory=tflite_factory,
+    )
+    orch.export_cfg = ExportConfig(tflite=True, tflite_int8=True)
+
+    history = orch.run(max_candidates=1)
+    baseline = history[0]
+    candidate = history[1]
+
+    assert baseline.extra["tflite_int8_export"] == "ok"
+    assert candidate.extra["tflite_int8_export"] == "ok"
+    assert Path(candidate.extra["tflite_int8_path"]).exists()
+    assert candidate.extra["deploy_size_bytes_by_backend"]["tflite_int8"] == len(b"fake-tflite-int8")

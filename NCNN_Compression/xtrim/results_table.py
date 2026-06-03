@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict
 
 from .types import HistoryItem, CandidateConfig, Metrics
 from .pareto import avg_latency, pareto_front
@@ -65,10 +65,148 @@ def _find_baseline_acc(history: List[HistoryItem]) -> float:
     return max(h.metrics.acc for h in valid) if valid else 0.0
 
 
+def _as_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_acc(value: object) -> str:
+    value_f = _as_float(value)
+    return f"{value_f:.4f}" if value_f is not None else "---"
+
+
+def _fmt_delta(value: object) -> str:
+    value_f = _as_float(value)
+    return f"{value_f:+.4f}" if value_f is not None else "---"
+
+
+def _deploy_label(kind: object) -> str:
+    labels = {
+        "fp32_raw_baseline": "RAW FP32",
+        "fp32": "ONNX FP32",
+        "int8_before_qat": "PTQ INT8",
+        "qat_fp32": "QAT FP32",
+        "int8_after_qat": "QAT INT8",
+    }
+    if kind is None:
+        return "---"
+    return labels.get(str(kind), str(kind))
+
+
+def _deploy_acc(h: HistoryItem) -> float:
+    extra_acc = _as_float(h.extra.get("acc_deploy"))
+    return float(extra_acc) if extra_acc is not None else float(h.metrics.acc)
+
+
+def _deploy_metric(h: HistoryItem, name: str) -> Optional[float]:
+    # Prefer explicitly selected deploy-artifact metrics stored in extra. Fall
+    # back to Metrics fields for backward/forward JSONL compatibility.
+    value = _as_float(h.extra.get(f"{name}_deploy"))
+    if value is not None:
+        return value
+    return _as_float(getattr(h.metrics, name, None))
+
+
+def _baseline_metric(history: List[HistoryItem], name: str) -> Optional[float]:
+    """Return an auxiliary metric for the initial raw/baseline model.
+
+    New histories contain a dedicated reference baseline item. For older
+    histories, fall back to an exact uncompressed candidate when present.
+    """
+    ref = _reference_baseline(history)
+    if ref is not None:
+        return _deploy_metric(ref, name)
+
+    valid = [h for h in history if not h.extra.get("failed", False)]
+    exact = [
+        h
+        for h in valid
+        if h.candidate.width_mult == 1.0
+        and h.candidate.prune_ratio == 0.0
+        and h.candidate.sparse_1x1 == 0.0
+        and h.candidate.lowrank_rank == 0
+    ]
+    if exact:
+        candidates = [_deploy_metric(h, name) for h in exact]
+        candidates = [v for v in candidates if v is not None]
+        return max(candidates) if candidates else None
+    return None
+
+
+
+def _fmt_latency(value: object) -> str:
+    value_f = _as_float(value)
+    return f"{value_f:.1f}" if value_f is not None else "---"
+
+
+def _latency_extra_keys(history: List[HistoryItem]) -> List[str]:
+    """Return latency keys for optional per-profile/per-device columns.
+
+    The regular Lat (ms) column is still the aggregate value. Extra latency
+    columns are useful when benchmark_profiles are enabled and latency_ms keys
+    look like "profile/device". For a single key, the aggregate column is
+    enough, so no extra latency column is produced.
+    """
+    keys: List[str] = []
+    seen: Set[str] = set()
+    for h in history:
+        if h.extra.get("failed", False):
+            continue
+        for key in h.metrics.latency_ms.keys():
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys if len(keys) > 1 else []
+
+
+def _base_latency_label(key: str) -> str:
+    if "/" in key:
+        profile, device = key.split("/", 1)
+    else:
+        profile, device = "", key
+
+    profile_l = profile.lower()
+    if "npu" in profile_l or "nnapi" in profile_l:
+        return "Lat NPU"
+    if "ncnn" in profile_l:
+        return "Lat NCNN"
+    if "cpu" in profile_l or "xnnpack" in profile_l:
+        return "Lat CPU"
+    if profile:
+        return f"Lat {profile}"
+    return f"Lat {device}"
+
+
+def _latency_column_labels(keys: List[str]) -> Dict[str, str]:
+    bases: Dict[str, int] = {}
+    for key in keys:
+        base = _base_latency_label(key)
+        bases[base] = bases.get(base, 0) + 1
+
+    labels: Dict[str, str] = {}
+    used: Dict[str, int] = {}
+    for key in keys:
+        base = _base_latency_label(key)
+        label = base
+        if bases[base] > 1:
+            device = key.split("/", 1)[1] if "/" in key else key
+            label = f"{base}:{device}"
+        count = used.get(label, 0)
+        used[label] = count + 1
+        if count:
+            label = f"{label}_{count + 1}"
+        labels[key] = label
+    return labels
+
 def print_results_table(
     history: List[HistoryItem],
     baseline_acc: Optional[float] = None,
     title: str = "RESULTS SUMMARY",
+    hide_extra: bool = False,
 ) -> None:
     if not history:
         print("[results] No candidates evaluated.")
@@ -86,20 +224,27 @@ def print_results_table(
         baseline_acc = _find_baseline_acc(history)
 
     baseline_size = _baseline_size(history)
+    baseline_precision = _baseline_metric(history, "precision")
+    baseline_recall = _baseline_metric(history, "recall")
+    baseline_iou = _baseline_metric(history, "iou")
 
-    sorted_history = sorted(ok_history, key=lambda h: -h.metrics.acc)
+    sorted_history = sorted(ok_history, key=_deploy_acc, reverse=True)
 
     W_TAG = max(24, max(len(h.candidate.tag) for h in candidate_history) if candidate_history else 24)
     W_CFG = 16
-    W_MAP = 8
-    W_DMAP = 8
-    W_PTQ = 8
-    W_DINT8 = 7
-    W_QAT = 8
+    W_ACC = 9
+    W_DELTA = 9
+    W_DEPLOY = 11
     W_LAT = 10
     W_SIZE = 9
     W_COMPR = 7
     W_P = 1
+
+    latency_extra_keys = _latency_extra_keys(ok_history) if not hide_extra else []
+    latency_extra_labels = _latency_column_labels(latency_extra_keys)
+    latency_extra_widths = {
+        key: max(10, len(label)) for key, label in latency_extra_labels.items()
+    }
 
     def _col(label: str, w: int, align: str = ">") -> str:
         return f"{label:{align}{w}}"
@@ -108,16 +253,37 @@ def print_results_table(
         "  #",
         _col("Candidate", W_TAG, "<"),
         _col("Config", W_CFG, "<"),
-        _col("mAP", W_MAP),
-        _col("Δ mAP", W_DMAP),
-        _col("mAP PTQ", W_PTQ),
-        _col("Δ INT8", W_DINT8),
-        _col("mAP QAT", W_QAT),
+        _col("Torch", W_ACC),
+        _col("ONNX", W_ACC),
+        _col("PTQ", W_ACC),
+        _col("Δ PTQ", W_DELTA),
+        _col("QAT", W_ACC),
+        _col("QAT INT8", W_ACC),
+        _col("Δ QAT8", W_DELTA),
+        _col("Final", W_ACC),
+        _col("Δ Final", W_DELTA),
+    ]
+    if not hide_extra:
+        header_parts.extend([
+            _col("Init Prec", W_ACC),
+            _col("Init Rec", W_ACC),
+            _col("Init IoU", W_ACC),
+            _col("Prec", W_ACC),
+            _col("Recall", W_ACC),
+            _col("IoU", W_ACC),
+        ])
+    header_parts.extend([
+        _col("Deploy", W_DEPLOY),
         _col("Lat (ms)", W_LAT),
+    ])
+    for key in latency_extra_keys:
+        label = latency_extra_labels[key]
+        header_parts.append(_col(label, latency_extra_widths[key]))
+    header_parts.extend([
         _col("Size (MB)", W_SIZE),
         _col("Compr×", W_COMPR),
         _col("P", W_P),
-    ]
+    ])
     header = "  ".join(header_parts)
     sep = "-" * len(header)
     border = "=" * len(header)
@@ -129,11 +295,20 @@ def print_results_table(
         ref_lat = avg_latency(ref_item.metrics.latency_ms)
         ref_lat_str = f"{ref_lat:.1f}" if ref_lat != float('inf') else "---"
         ref_size_mb = ref_item.metrics.size_bytes / 1024 / 1024
+        extra_baseline_metrics = ""
+        if not hide_extra:
+            if baseline_precision is not None:
+                extra_baseline_metrics += f"  |  Prec: {baseline_precision:.4f}"
+            if baseline_recall is not None:
+                extra_baseline_metrics += f"  |  Recall: {baseline_recall:.4f}"
+            if baseline_iou is not None:
+                extra_baseline_metrics += f"  |  IoU: {baseline_iou:.4f}"
         print(
             f"  Reference baseline (raw FP32): {baseline_acc:.4f}  |  "
             f"Lat: {ref_lat_str} ms  |  "
             f"Size: {ref_size_mb:.1f} MB  |  "
             f"Pareto-optimal: {len(pareto_set)} / {len(ok_history)}"
+            + extra_baseline_metrics
             + (f"  |  Failed: {len(failed_history)}" if failed_history else "")
         )
     else:
@@ -158,20 +333,28 @@ def print_results_table(
         lat_str = f"{lat:.1f}" if lat != float("inf") else "---"
         size_mb = m.size_bytes / 1024 / 1024
 
-        acc = m.acc
-        delta_map = acc - baseline_acc
-
+        torch_acc = extra.get("acc_recovered_torch")
+        onnx_acc = extra.get("acc_onnx")
         ptq_acc = extra.get("acc_onnx_int8")
-        ptq_str = f"{ptq_acc:.4f}" if ptq_acc is not None else "---"
+        qat_acc = extra.get("acc_onnx_after_qat")
+        qat_int8_acc = extra.get("acc_onnx_int8_after_qat")
+        final_acc = _deploy_acc(h)
+        delta_final = final_acc - baseline_acc
+        precision = _deploy_metric(h, "precision")
+        recall = _deploy_metric(h, "recall")
+        iou = _deploy_metric(h, "iou")
 
-        drop_int8 = extra.get("acc_drop_int8")
-        if drop_int8 is not None:
-            delta_int8_str = f"{-drop_int8:+.4f}"
-        else:
-            delta_int8_str = "---"
+        ptq_delta = None
+        onnx_acc_f = _as_float(onnx_acc)
+        ptq_acc_f = _as_float(ptq_acc)
+        if onnx_acc_f is not None and ptq_acc_f is not None:
+            ptq_delta = ptq_acc_f - onnx_acc_f
 
-        qat_int8 = extra.get("acc_onnx_int8_after_qat")
-        qat_str = f"{qat_int8:.4f}" if qat_int8 is not None else "---"
+        qat_int8_delta = None
+        qat_acc_f = _as_float(qat_acc)
+        qat_int8_acc_f = _as_float(qat_int8_acc)
+        if qat_acc_f is not None and qat_int8_acc_f is not None:
+            qat_int8_delta = qat_int8_acc_f - qat_acc_f
 
         if baseline_size and baseline_size > 0 and m.size_bytes > 0:
             compr = baseline_size / m.size_bytes
@@ -180,25 +363,60 @@ def print_results_table(
             compr_str = "---"
 
         pareto_flag = "*" if cand.tag in pareto_set else " "
+        deploy_str = _deploy_label(extra.get("deploy_onnx_kind"))
 
         row_parts = [
             f"{i:>3}",
             _col(cand.tag, W_TAG, "<"),
             _col(config_str, W_CFG, "<"),
-            _col(f"{acc:.4f}", W_MAP),
-            _col(f"{delta_map:+.4f}", W_DMAP),
-            _col(ptq_str, W_PTQ),
-            _col(delta_int8_str, W_DINT8),
-            _col(qat_str, W_QAT),
+            _col(_fmt_acc(torch_acc), W_ACC),
+            _col(_fmt_acc(onnx_acc), W_ACC),
+            _col(_fmt_acc(ptq_acc), W_ACC),
+            _col(_fmt_delta(ptq_delta), W_DELTA),
+            _col(_fmt_acc(qat_acc), W_ACC),
+            _col(_fmt_acc(qat_int8_acc), W_ACC),
+            _col(_fmt_delta(qat_int8_delta), W_DELTA),
+            _col(f"{final_acc:.4f}", W_ACC),
+            _col(f"{delta_final:+.4f}", W_DELTA),
+        ]
+        if not hide_extra:
+            row_parts.extend([
+                _col(_fmt_acc(baseline_precision), W_ACC),
+                _col(_fmt_acc(baseline_recall), W_ACC),
+                _col(_fmt_acc(baseline_iou), W_ACC),
+                _col(_fmt_acc(precision), W_ACC),
+                _col(_fmt_acc(recall), W_ACC),
+                _col(_fmt_acc(iou), W_ACC),
+            ])
+        row_parts.extend([
+            _col(deploy_str, W_DEPLOY),
             _col(lat_str, W_LAT),
+        ])
+        for key in latency_extra_keys:
+            row_parts.append(_col(_fmt_latency(m.latency_ms.get(key)), latency_extra_widths[key]))
+        row_parts.extend([
             _col(f"{size_mb:.1f}", W_SIZE),
             _col(compr_str, W_COMPR),
             _col(pareto_flag, W_P),
-        ]
+        ])
         print("  ".join(row_parts))
 
     print(sep)
-    print("  * = Pareto-optimal  |  mAP/Δ mAP = selected deploy artifact vs raw reference baseline  |  Δ INT8 = PTQ - FP32  |  Compr× = baseline_size / candidate_size")
+    legend_parts = [
+        "* = Pareto-optimal",
+        "Torch = recovered/pruned PyTorch mAP",
+        "ONNX = exported FP32 before QAT",
+        "PTQ = INT8 before QAT",
+        "QAT = exported FP32 after QAT",
+        "QAT INT8 = INT8 after QAT",
+        "Final/Δ Final = selected deploy artifact vs raw FP32 baseline",
+    ]
+    if not hide_extra:
+        legend_parts.append("Prec/Recall/IoU = selected deploy artifact metrics")
+        if latency_extra_keys:
+            legend_parts.append("Lat CPU/NCNN/NPU = per-profile/per-device latency; Lat (ms) = average")
+    legend_parts.append("Compr× = baseline_size / deploy_candidate_size")
+    print("  " + "  |  ".join(legend_parts))
 
     if failed_history:
         print(f"\n  {'FAILED CANDIDATES':}")
@@ -210,7 +428,6 @@ def print_results_table(
         print(sep)
 
     print(border + "\n")
-
 
 def plot_pareto(
     history: List[HistoryItem],

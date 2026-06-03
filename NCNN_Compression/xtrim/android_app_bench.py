@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 
 from .types import DeviceConfig, ToolsConfig, AndroidAppBenchConfig
+from .runtime_backend import effective_ncnn_gpu_device, resolve_ncnn_runtime
 
 
 class CmdError(RuntimeError):
@@ -125,6 +126,8 @@ class AndroidAppBench:
             raise RuntimeError(f"Device not ready: {device.name} ({device.serial})")
 
         run_id = uuid.uuid4().hex[:10]
+        runtime = resolve_ncnn_runtime(device)
+        gpu_device = effective_ncnn_gpu_device(device)
 
         self.force_stop(device)
         if device.cooling_down > 0:
@@ -160,6 +163,12 @@ class AndroidAppBench:
             "--es", "bin", rbin,
             "--es", "dataset", str(cfg.dataset),
             "--es", "run_id", run_id,
+            # Runtime is consumed by the updated Android CliBenchActivity.
+            # device/gpu_device are also passed for backward-compatible builds.
+            "--es", "runtime", runtime,
+            "--es", "backend", runtime,
+            "--ei", "device", str(int(gpu_device)),
+            "--ei", "gpu_device", str(int(gpu_device)),
             "--ei", "imgsz", str(int(cfg.imgsz)),
             "--ei", "loops", str(int(cfg.loops)),
             "--ei", "warmup", str(int(cfg.warmup)),
@@ -193,6 +202,14 @@ class AndroidAppBench:
                 if "run_id" in data and str(data["run_id"]) != run_id:
                     time.sleep(float(cfg.poll_interval_sec))
                     continue
+                # Older Android app builds may not echo these fields yet.
+                # Add them on the Python side so logs and history remain explicit.
+                data.setdefault("runtime", runtime)
+                data.setdefault("backend", runtime)
+                data.setdefault("use_gpu", runtime == "ncnn_vulkan")
+                data.setdefault("gpu_device", gpu_device)
+                data.setdefault("device_name", device.name)
+                data.setdefault("serial", device.serial)
                 return data
 
             time.sleep(float(cfg.poll_interval_sec))

@@ -55,6 +55,13 @@ def test_staged_candidate_runs_intermediate_recovery_and_records_history(make_or
         build_candidate_fn=build,
         apply_pruning_stage_fn=apply_stage,
         finetune_fn=finetune,
+        eval_metrics_fn=lambda _student: {
+            "map50_95": 0.7,
+            "precision": 0.61,
+            "recall": 0.72,
+            "iou": 0.76,
+            "map50": 0.83,
+        },
     )
 
     history = orch.run(max_candidates=1)
@@ -68,6 +75,16 @@ def test_staged_candidate_runs_intermediate_recovery_and_records_history(make_or
     assert [s["target_total"] for s in stages] == [0.6, 0.7, 0.75, 0.8]
     assert [s["acc_before_recovery"] for s in stages] == pytest.approx([0.7, 0.7, 0.7, 0.7])
     assert [s["acc_after_recovery"] for s in stages] == pytest.approx([0.7, 0.7, 0.7, 0.7])
+    assert [s["precision_before_recovery"] for s in stages] == pytest.approx([0.61, 0.61, 0.61, 0.61])
+    assert [s["recall_after_recovery"] for s in stages] == pytest.approx([0.72, 0.72, 0.72, 0.72])
+    assert [s["iou_after_recovery"] for s in stages] == pytest.approx([0.76, 0.76, 0.76, 0.76])
+    assert stages[-1]["metrics_after_recovery"] == {
+        "map50_95": 0.7,
+        "precision": 0.61,
+        "recall": 0.72,
+        "iou": 0.76,
+        "map50": 0.83,
+    }
     assert candidate.extra["finetune_logs"] == {"epochs": 100, "lr": 2e-4}
 
 

@@ -8,3 +8,7 @@ pillow>=10.0.0
 onnxsim
 torch
 pytest
+tf_keras<=2.19.0
+onnx_graphsurgeon>=0.3.26
+onnx2tf>=1.26.3,<1.29.0
+protobuf>=5
