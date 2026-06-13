@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Legacy LUT latency estimator. It is kept for old experiments and tests."""
+
 import json
 import math
 from pathlib import Path

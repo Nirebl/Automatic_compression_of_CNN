@@ -85,7 +85,7 @@ def _find_detect_module(model: nn.Module) -> nn.Module | None:
 
 
 def _assert_end2end_training_head_is_intact(model: nn.Module) -> None:
-    """Raise a clear error if an end-to-end Detect head was already fused for inference."""
+    """Проверяет, что end-to-end Detect-head еще пригоден для обучения и не был слит для инференса."""
     head = _find_detect_module(model)
     if head is None or not bool(getattr(head, "end2end", False)):
         return
@@ -195,11 +195,7 @@ def _normalize_loss_hyp(obj: Any) -> None:
 
 
 def _init_model_criterion(student_model: nn.Module):
-    """
-    Let the model choose the correct criterion for its current head type
-    (plain detect vs end-to-end / one2one / one2many).
-    Then normalize hyp objects so inner losses can safely access hyp.box/hyp.cls/hyp.dfl.
-    """
+    """Создает loss для текущего типа Detect-head и приводит hyp к виду, который ожидают внутренние loss-функции."""
     if hasattr(student_model, "criterion"):
         try:
             delattr(student_model, "criterion")

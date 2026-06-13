@@ -11,13 +11,9 @@ from .types import DeviceConfig, ToolsConfig, OrtAndroidBenchConfig
 
 
 class AndroidTfliteBench:
-    """ADB launcher for CliBenchActivity backend=tflite.
+    """Запускает Android-бенчмарк для TFLite-моделей через ADB.
 
-    The updated Android app accepts the same Activity and result JSON contract as
-    the ORT benchmark, but consumes a .tflite model and a TFLite delegate name:
-    xnnpack/cpu/gpu.  We intentionally reuse OrtAndroidBenchConfig for common
-    fields (package, activity, dataset, loops, warmup, remote_dir, etc.) so YAML
-    does not need another large duplicated config block.
+    Использует почти те же настройки, что и ORT-бенчмарк, но передает .tflite-файл и выбранный delegate.
     """
 
     def __init__(self, tools: ToolsConfig, cfg: OrtAndroidBenchConfig, *, delegate: str = "xnnpack"):

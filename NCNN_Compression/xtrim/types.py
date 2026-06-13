@@ -13,15 +13,11 @@ class DeviceConfig:
     threads: int = 4
     loops: int = 50
     powersave: int = 2
-    # Explicit Android/NCNN runtime. Preferred values:
-    #   ncnn_cpu    -> run on phone CPU
-    #   ncnn_vulkan -> run on phone GPU through NCNN Vulkan
-    # If omitted, legacy device/gpu_device fields are used.
+    # Явный runtime для Android/NCNN: ncnn_cpu или ncnn_vulkan.
+    # Если не задан, используются старые поля device/gpu_device.
     runtime: Optional[str] = None
-    # Readable legacy alias requested for devices[] configs:
-    #   device: -1 -> ncnn_cpu
-    #   device:  0 -> ncnn_vulkan
-    # Keep model.device separate: it is still PyTorch/Ultralytics device on PC.
+    # Старый короткий вариант для devices[]: -1 — CPU, 0 и выше — Vulkan GPU.
+    # Не путать с model.device, который относится к PyTorch на рабочей станции.
     device: Optional[int] = None
     gpu_device: int = -1
     cooling_down: int = 1
@@ -42,46 +38,32 @@ class ExportConfig:
     dynamo: bool = False
     bench_shape: str = "[640,640,3]"
 
-    # Optional additional NCNN artifact export. ONNX remains the main export
-    # format; when ncnn=True the pipeline also writes .param/.bin files next to
-    # the ONNX artifacts without changing the selected deploy ONNX model.
+    # Дополнительно сохранять NCNN-файлы рядом с ONNX, не меняя выбранную deploy-модель.
     ncnn: bool = False
-    # Which FP32 ONNX graph to convert to NCNN. The default avoids ONNX INT8/QDQ
-    # graphs because onnx2ncnn may handle them inconsistently. Supported values:
-    #   fp32       -> export/model.onnx
-    #   qat_fp32   -> export/model_qat.onnx if it exists, otherwise model.onnx
-    #   deploy_fp32 -> QAT FP32 when the deploy model came from QAT, otherwise model.onnx
+    # Какой FP32 ONNX использовать для NCNN. По умолчанию не берем INT8/QDQ-графы.
+    # fp32 — model.onnx; qat_fp32 — model_qat.onnx при наличии; deploy_fp32 — FP32-версия выбранной deploy-модели.
     ncnn_source: str = "qat_fp32"
     ncnn_optimize: bool = True
-    # None keeps legacy behavior for NCNN-only runs: ptq.enabled controls ncnn2int8.
-    # Explicit false is recommended for ONNX+NCNN artifact export to avoid applying
-    # NCNN INT8 when only FP32/FP16-compatible NCNN files are needed.
+    # None сохраняет старое поведение для NCNN-only запусков. Для ONNX+NCNN обычно лучше явно ставить false.
     ncnn_int8: Optional[bool] = None
-    # If false, a failed NCNN conversion is recorded in history but does not stop
-    # an ORT-only experiment. NCNN benchmark profiles still fail if the artifact
-    # is unavailable and required.
+    # Если false, ошибка NCNN-экспорта пишется в историю, но не останавливает ORT-only эксперимент.
     ncnn_required: bool = False
 
-    # Optional TensorFlow Lite artifact export. This is intentionally separated
-    # from ONNX PTQ and NCNN PTQ: it creates additional .tflite files for later
-    # Android TFLite CPU/GPU benchmarking without changing the selected ONNX
-    # deploy artifact used by the current ORT path.
+    # Дополнительный экспорт в TFLite для Android-бенчмарков CPU/GPU. Выбранная ONNX deploy-модель при этом не меняется.
     tflite: bool = False
     tflite_int8: bool = False
     tflite_int8_required: bool = False
     tflite_int8_name: str = "model_int8.tflite"
-    # Ultralytics/onnx2tf can emit float16 TFLite as part of the same export
-    # directory.  Copy it next to model_int8.tflite so Android GPU delegate
-    # benchmarks can use a stable path.
+    # FP32 TFLite для исходной модели, без случайного перевода baseline в INT8/FP16.
+    tflite_fp32_name: str = "model_fp32.tflite"
+    tflite_fp32_required: bool = False
+    # FP16 TFLite сохраняется под стабильным именем для GPU-бенчмарка на Android.
     tflite_fp16: bool = False
     tflite_fp16_required: bool = False
     tflite_fp16_name: str = "model_fp16.tflite"
-    # TFLite export is performed on CPU by default even when model.device=0.
-    # This avoids Ultralytics trying to install/use onnxruntime-gpu during
-    # export and keeps the artifact generation independent from the training GPU.
+    # TFLite экспорт по умолчанию идет на CPU, чтобы не зависеть от GPU-настроек обучения.
     tflite_int8_device: str = "cpu"
-    # Disabling ONNX simplification for the internal Ultralytics TFLite path
-    # avoids an additional onnxslim/onnxruntime-gpu dependency during export.
+    # Упрощение ONNX отключено, чтобы не тянуть лишние зависимости при TFLite-экспорте.
     tflite_int8_simplify: bool = False
 
 
@@ -106,6 +88,7 @@ class ToolsConfig:
     ncnn2table: str = "ncnn2table"
     ncnn2int8: str = "ncnn2int8"
     benchncnn_local: str = "benchncnn"
+    # Legacy NCNN demo. The current Android path uses the app through ADB.
     yolo_detect_local: str = "android_native/build-android/bin/xtrim_yolo_detect"
 
 
@@ -144,6 +127,8 @@ class GumbelChoiceConfig:
 
 @dataclass(frozen=True)
 class LatencyLUTConfig:
+    """Legacy LUT regularization. It is kept only for old experiments."""
+
     enabled: bool = False
     lut_path: str = "assets/lut_sample.json"
     budget_ms: float = 15.0
@@ -175,9 +160,7 @@ class CandidateConfig:
 
 @dataclass
 class Metrics:
-    # acc is kept as the primary optimization metric for backward compatibility.
-    # For detection pipelines it means mAP50-95. Precision/recall/iou/map50 are
-    # optional auxiliary deploy metrics saved when the evaluator can provide them.
+    # acc оставлен для совместимости; для детекции это mAP50-95. Остальные метрики сохраняются при наличии.
     acc: float
     size_bytes: int
     latency_ms: Dict[str, float]
@@ -212,9 +195,7 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrimConfig:
-    # How the final prune_ratio is reached:
-    # - one_shot: remove all requested channels in one operation;
-    # - staged: approach the same final target through intermediate milestones.
+    # Как достигается итоговый prune_ratio: сразу одним шагом или через стадии.
     prune_mode: str = "one_shot"
     channel_round: int = 8
     min_channels: int = 8
@@ -232,26 +213,19 @@ class TrimConfig:
 
 @dataclass(frozen=True)
 class StagedPruningConfig:
-    # Cumulative pruning targets relative to the original model.
-    # The candidate's final prune_ratio is appended automatically, so it should
-    # normally not be duplicated here.
+    # Промежуточные цели прунинга относительно исходной модели. Итоговый prune_ratio кандидата добавляется автоматически.
     milestones: tuple = ()
 
-    # How staged pruning interprets milestones:
-    # - ratio_schedule: every stage uses only its local pruning ratio;
-    # - match_one_shot_architecture: the final one-shot architecture is built on
-    #   a shadow copy and staged pruning is forced to reach the same final widths.
+    # Режим стадийного прунинга: локальные шаги или подгонка к итоговой one-shot архитектуре.
     target_mode: str = "ratio_schedule"
 
-    # Recovery settings for all non-final stages. Final stage falls back to the
-    # regular train config unless final_epochs/final_lr are explicitly set.
+    # Настройки восстановления качества для промежуточных стадий. Финальная стадия использует обычный train config, если не задано другое.
     intermediate_epochs: int = 30
     intermediate_lr: Optional[float] = None
     final_epochs: Optional[int] = None
     final_lr: Optional[float] = None
 
-    # Evaluating every stage is slower, but makes the whole pruning trajectory
-    # visible in history.jsonl.
+    # Если включено, каждая стадия отдельно попадает в history.jsonl.
     eval_after_each_stage: bool = True
 
 
@@ -269,15 +243,14 @@ class LatencyConfig:
 
 @dataclass(frozen=True)
 class BenchmarkProfileConfig:
-    # Optional multi-backend/mobile benchmark profile. If benchmark_profiles is
-    # empty in YAML, the pipeline keeps the legacy single latency.backend path.
+    # Дополнительный профиль бенчмарка. Если список пуст, используется старый latency.backend.
     name: str = ""
-    backend: str = ""  # benchncnn | android_app | ort_android | tflite_android
+    backend: str = ""  # поддерживаемые профили: benchncnn, android_app, ort_android, tflite_android
     enabled: bool = True
     required: bool = True
-    device_names: tuple = ()  # match by DeviceConfig.name or serial; empty = all devices
+    device_names: tuple = ()  # имена или serial устройств; пусто = все устройства
 
-    # Device/benchmark overrides. None means "use the regular config value".
+    # Переопределения для устройства и бенчмарка. None означает значение из основного конфига.
     threads: Optional[int] = None
     loops: Optional[int] = None
     powersave: Optional[int] = None
@@ -287,7 +260,7 @@ class BenchmarkProfileConfig:
     cooling_down: Optional[int] = None
     shape: Optional[str] = None
 
-    # Android app / ORT benchmark overrides.
+    # Переопределения для Android app / ORT / TFLite бенчмарков.
     package: Optional[str] = None
     activity: Optional[str] = None
     dataset: Optional[str] = None
@@ -301,9 +274,9 @@ class BenchmarkProfileConfig:
     conf: Optional[float] = None
     iou: Optional[float] = None
     max_det: Optional[int] = None
-    provider: Optional[str] = None  # ORT: xnnpack | nnapi | cpu; also accepted as TFLite delegate fallback
-    delegate: Optional[str] = None  # TFLite: xnnpack | cpu | gpu
-    artifact: Optional[str] = None  # TFLite artifact selector: tflite_int8 | tflite_fp16, or explicit path
+    provider: Optional[str] = None  # ORT: xnnpack, nnapi или cpu; для TFLite может быть fallback delegate
+    delegate: Optional[str] = None  # TFLite: xnnpack, cpu или gpu
+    artifact: Optional[str] = None  # TFLite-артефакт: tflite_int8, tflite_fp16 или явный путь
     optimized: Optional[bool] = None
     result_tag: Optional[str] = None
     timeout_sec: Optional[int] = None
@@ -376,6 +349,8 @@ class DilatedConfig:
 
 @dataclass(frozen=True)
 class AndroidDemoConfig:
+    """Legacy NCNN demo with a standalone native binary."""
+
     enabled: bool = False
     sample_image: str = "assets/demo.jpg"
     imgsz: int = 640
@@ -402,9 +377,7 @@ class AndroidAppBenchConfig:
     package: str = "com.example.testyolo"
     activity: str = ".CliBenchActivity"
     dataset: str = "coco"
-    # If enabled, the orchestrator selects a deterministic subset of the dataset
-    # split, pushes the images to Android, and passes image_dir/image_list extras
-    # to the benchmark activity. The Android app must support these extras.
+    # Если включено, на устройство отправляется фиксированный набор изображений для бенчмарка.
     push_dataset_images: bool = False
     dataset_split: str = "val"
     dataset_max_images: int = 32
@@ -430,8 +403,7 @@ class OrtAndroidBenchConfig:
     package: str = "com.example.testyolo"
     activity: str = ".CliBenchActivity"
     dataset: str = "coco"
-    # Same contract as AndroidAppBenchConfig: the Python side pushes a real
-    # image subset and the Android activity consumes image_dir/image_list extras.
+    # То же поведение, что и в AndroidAppBenchConfig: Python отправляет изображения, приложение их читает.
     push_dataset_images: bool = False
     dataset_split: str = "val"
     dataset_max_images: int = 32
@@ -444,7 +416,7 @@ class OrtAndroidBenchConfig:
     conf: float = 0.25
     iou: float = 0.45
     max_det: int = 100
-    provider: str = "xnnpack"   # xnnpack | nnapi
+    provider: str = "xnnpack"
     result_tag: str = "XTRIM_RESULT"
     timeout_sec: int = 180
     poll_interval_sec: float = 0.6

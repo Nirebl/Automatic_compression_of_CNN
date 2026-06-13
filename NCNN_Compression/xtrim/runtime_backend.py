@@ -27,12 +27,7 @@ _GPU_ALIASES = {
 
 
 def normalize_ncnn_runtime(value: Optional[Any]) -> Optional[str]:
-    """Normalize user-facing runtime names for NCNN Android benchmarking.
-
-    Returns None when no runtime was specified. Raises ValueError for unknown
-    non-empty values, because silently falling back to CPU/GPU would make
-    benchmark tables hard to trust.
-    """
+    """Приводит название NCNN runtime к единому виду."""
 
     if value is None:
         return None
@@ -53,12 +48,7 @@ def normalize_ncnn_runtime(value: Optional[Any]) -> Optional[str]:
 
 
 def ncnn_runtime_from_legacy_device_id(value: Optional[Any]) -> Optional[str]:
-    """Map legacy device/gpu_device numbers to explicit runtime names.
-
-    This keeps old configs working:
-      - -1 means NCNN CPU
-      -  0 or any non-negative value means NCNN Vulkan GPU
-    """
+    """Преобразует старые значения device/gpu_device в явный NCNN runtime."""
 
     if value is None:
         return None
@@ -72,14 +62,7 @@ def ncnn_runtime_from_legacy_device_id(value: Optional[Any]) -> Optional[str]:
 
 
 def resolve_ncnn_runtime(device: Any, default: str = NCNN_CPU) -> str:
-    """Resolve the effective NCNN runtime from a DeviceConfig-like object.
-
-    Priority:
-      1. devices[].runtime
-      2. devices[].device      # new readable legacy alias requested by user
-      3. devices[].gpu_device  # old benchncnn-style field
-      4. default
-    """
+    """Определяет, какой NCNN runtime нужно использовать для устройства."""
 
     explicit = normalize_ncnn_runtime(getattr(device, "runtime", None))
     if explicit is not None:
@@ -107,6 +90,6 @@ def effective_ncnn_gpu_device(device: Any) -> int:
 
 
 def ncnn_runtime_label(device: Any) -> str:
-    """Small helper for cache keys, logs and table/debug text."""
+    """Возвращает короткую подпись runtime для логов, таблиц и кэша."""
 
     return resolve_ncnn_runtime(device)

@@ -76,6 +76,8 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     kd_cfg = KDConfig(**cfg.get("kd", {}))
     onnx_ptq_cfg = OnnxPTQConfig(**cfg.get("onnx_ptq", {}))
     qat_cfg = QATConfig(**cfg.get("qat", {}))
+    # Legacy block: old NCNN demo. Active configs no longer include it,
+    # but old experiment configs can still be loaded.
     android_demo_cfg = AndroidDemoConfig(**cfg.get("android_demo", {}))
     search_cfg = SearchConfig(**cfg.get("search", {}))
     android_app_bench_cfg = AndroidAppBenchConfig(**cfg.get("android_app_bench", {}))
@@ -84,6 +86,7 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     op_choice_plan: Dict[str, str] = op_choice_raw.pop("plan", {}) or {}
     op_choice_cfg = OperatorChoiceConfig(**op_choice_raw)
 
+    # Legacy block: LUT-based latency regularization from early experiments.
     lut_cfg = LatencyLUTConfig(**cfg.get("latency_lut", {}))
     gumbel_cfg = GumbelChoiceConfig(**cfg.get("gumbel_choice", {}))
     lowrank_cfg = LowRankConfig(**cfg.get("lowrank", {}))
@@ -98,10 +101,6 @@ def parse_config(cfg: Dict[str, Any]) -> Tuple[
     benchmark_profiles: List[BenchmarkProfileConfig] = []
     for i, profile_raw in enumerate(cfg.get("benchmark_profiles", []) or []):
         raw = dict(profile_raw or {})
-        # Historically benchmark_profiles used either devices: [...] or
-        # device: "phone1" to select Android devices by name/serial.
-        # New NCNN runtime selection should be done with runtime: ncnn_cpu|ncnn_vulkan
-        # or gpu_device. If device is numeric, keep it as an override field.
         if "devices" in raw:
             devices_value = raw.pop("devices")
         elif "device_names" in raw:

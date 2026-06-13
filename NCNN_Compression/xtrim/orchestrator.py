@@ -69,6 +69,7 @@ class XTrimOrchestrator:
         eval_metrics_fn: Optional[Callable[[Any], Dict[str, float]]] = None,
         export_onnx_fn_factory: Callable[[Any, ExportConfig], Callable[[Path], None]] = lambda _m, _c: (lambda _p: None),
         export_tflite_int8_fn_factory: Optional[Callable[[Any, ExportConfig], Callable[[Path], Path]]] = None,
+        export_tflite_fp32_fn_factory: Optional[Callable[[Any, ExportConfig], Callable[[Path], Path]]] = None,
         eval_exported_onnx_fn: Optional[Callable[[Path], float]] = None,
         eval_exported_onnx_metrics_fn: Optional[Callable[[Path], Dict[str, float]]] = None,
         quantize_onnx_fn: Optional[Callable[[Path, Path, Path], Path]] = None,
@@ -103,6 +104,7 @@ class XTrimOrchestrator:
         self.eval_metrics_fn = eval_metrics_fn
         self.export_onnx_fn_factory = export_onnx_fn_factory
         self.export_tflite_int8_fn_factory = export_tflite_int8_fn_factory
+        self.export_tflite_fp32_fn_factory = export_tflite_fp32_fn_factory
         self.eval_exported_onnx_fn = eval_exported_onnx_fn
         self.eval_exported_onnx_metrics_fn = eval_exported_onnx_metrics_fn
         self.quantize_onnx_fn = quantize_onnx_fn
@@ -131,12 +133,7 @@ class XTrimOrchestrator:
 
 
     def prepare_benchmark_devices(self) -> List[DeviceConfig]:
-        """Prepare and keep only Android devices usable for the configured benchmarks.
-
-        This public wrapper is used by --rebench-existing.  The normal run() path
-        uses the same logic before candidate processing, so rebench and full runs
-        validate devices consistently.
-        """
+        """Проверяет устройства и оставляет только те, на которых можно запускать выбранные бенчмарки."""
         backends_to_prepare = {str(self.latency_cfg.backend).lower().strip()}
         backends_to_prepare.update(p.backend.lower().strip() for p in self._active_benchmark_profiles())
 
@@ -268,15 +265,13 @@ class XTrimOrchestrator:
             backend not in {"ort_android", "ort", "onnx"}
             or self._benchmark_profiles_require_ncnn()
             or self._export_config_requests_ncnn()
+            # Legacy NCNN demo still needs NCNN files when explicitly enabled.
             or bool(getattr(self.android_demo_cfg, "enabled", False))
         )
 
     def _ncnn_int8_enabled(self) -> bool:
         explicit = getattr(self.export_cfg, "ncnn_int8", None)
         if explicit is None:
-            # Legacy behavior: old NCNN-only experiments used ptq.enabled to mean
-            # ncnn2table/ncnn2int8. New ONNX+NCNN configs should set
-            # export.ncnn_int8=false to keep NCNN as FP32/FP16-compatible.
             return bool(self.ptq_cfg.enabled)
         return bool(explicit)
 
@@ -299,16 +294,11 @@ class XTrimOrchestrator:
             return onnx_fp32, "onnx_fp32_fallback_no_qat"
 
         if source in {"deploy_fp32", "selected_fp32"}:
-            # Never convert ONNX INT8/QDQ to NCNN by accident. If the selected
-            # deploy artifact is INT8 after QAT, use the QAT FP32 ONNX as the
-            # NCNN source. If it is INT8 before QAT, use the original FP32 ONNX.
             if deploy_onnx_kind in {"qat_fp32", "int8_after_qat"} and onnx_qat is not None and onnx_qat.exists():
                 return onnx_qat, "onnx_qat_fp32_for_deploy"
             return onnx_fp32, "onnx_fp32_for_deploy"
 
         if source in {"deploy", "selected"}:
-            # This mode is explicit and intentionally allows converting the
-            # selected deploy ONNX. For normal experiments prefer deploy_fp32.
             if deploy_onnx is not None and deploy_onnx.exists():
                 return deploy_onnx, f"onnx_selected_{deploy_onnx_kind or 'unknown'}"
             return onnx_fp32, "onnx_fp32_fallback_no_deploy"
@@ -369,11 +359,9 @@ class XTrimOrchestrator:
         extra: Optional[Dict[str, Any]] = None,
         source_label: str = "existing_onnx_fp32",
     ) -> tuple[Optional[NcnnModelPaths], Dict[str, Any]]:
-        """Convert an already existing ONNX file to NCNN for --rebench-existing.
+        """Готовит NCNN-файлы из уже существующей ONNX-модели для режима rebench.
 
-        This is intentionally public-ish because rebench works without rebuilding
-        the model. It lets a rebench config add NCNN CPU/Vulkan profiles even if
-        the original experiment saved only ONNX artifacts.
+        Это позволяет добавить NCNN CPU/Vulkan профили без повторной сборки модели.
         """
         extra_out: Dict[str, Any] = dict(extra or {})
         ncnn = self._prepare_ncnn_from_onnx(
@@ -448,10 +436,6 @@ class XTrimOrchestrator:
         return dataclasses.replace(self.android_app_bench_cfg, **self._cfg_overrides_from_profile(profile, allowed))
 
     def _tflite_cfg_for_profile(self, profile: BenchmarkProfileConfig) -> OrtAndroidBenchConfig:
-        # TFLite CliBenchActivity accepts almost the same launch extras as the
-        # ORT path. Reuse ort_android_bench as the base block to avoid a large
-        # duplicated YAML section. The actual TFLite delegate is stored on the
-        # profile as delegate/provider.
         allowed = [
             "package", "activity", "dataset", "push_dataset_images", "dataset_split",
             "dataset_max_images", "dataset_seed", "dataset_remote_subdir", "imgsz",
@@ -470,11 +454,7 @@ class XTrimOrchestrator:
 
     @staticmethod
     def _normalize_eval_metrics(raw: Any, acc_fallback: Optional[float] = None) -> Dict[str, float]:
-        """Normalize evaluator output to the pipeline metric schema.
-
-        The optimization metric is stored as map50_95. Other metrics are optional,
-        because older tests/custom evaluators may still return only a scalar mAP.
-        """
+        """Приводит результат валидации к единому набору метрик конвейера."""
         metrics: Dict[str, float] = {}
 
         def _put(dst_key: str, value: Any) -> None:
@@ -726,16 +706,23 @@ class XTrimOrchestrator:
                 apply_int8=False,
             )
 
-        tflite_int8 = self._maybe_export_tflite_int8(student, run_dir, extra)
+        tflite_fp32 = self._maybe_export_tflite_fp32_baseline(student, run_dir, extra)
         tflite_models = self._store_tflite_artifacts(run_dir, extra)
+        tflite_models_for_profiles = self._baseline_tflite_models_for_profiles(tflite_models)
+        if tflite_fp32 is not None:
+            extra["baseline_tflite_kind"] = "fp32"
+            extra["baseline_tflite_profile_note"] = (
+                "TFLite benchmark profiles for the raw baseline use model_fp32.tflite, "
+                "even when profile names contain int8/fp16."
+            )
 
         onnx_size_bytes = int(sizeof_file(onnx_path))
         ncnn_size_bytes = int(sizeof_file(ncnn_final.param) + sizeof_file(ncnn_final.bin)) if ncnn_final is not None else None
-        tflite_int8_size_bytes = int(sizeof_file(tflite_int8)) if tflite_int8 is not None else None
+        tflite_fp32_size_bytes = int(sizeof_file(tflite_fp32)) if tflite_fp32 is not None else None
         extra["deploy_size_bytes_by_backend"] = {
             "onnx": onnx_size_bytes,
             **({"ncnn": ncnn_size_bytes} if ncnn_size_bytes is not None else {}),
-            **({"tflite_int8": tflite_int8_size_bytes} if tflite_int8_size_bytes is not None else {}),
+            **({"tflite_fp32": tflite_fp32_size_bytes} if tflite_fp32_size_bytes is not None else {}),
         }
 
         if profiles_active:
@@ -743,7 +730,7 @@ class XTrimOrchestrator:
                 ncnn_param=ncnn_final.param if ncnn_final is not None else None,
                 ncnn_bin=ncnn_final.bin if ncnn_final is not None else None,
                 onnx_model=onnx_path,
-                tflite_models=tflite_models,
+                tflite_models=tflite_models_for_profiles,
                 run_dir=run_dir,
             )
             extra["benchmark_profiles"] = profile_details
@@ -1024,6 +1011,10 @@ class XTrimOrchestrator:
             "full_integer": "int8",
             "full_integer_quant": "int8",
             "integer_quant": "int8",
+            "fp32": "fp32",
+            "float32": "fp32",
+            "tflite_fp32": "fp32",
+            "model_fp32": "fp32",
             "fp16": "fp16",
             "float16": "fp16",
             "tflite_fp16": "fp16",
@@ -1033,7 +1024,6 @@ class XTrimOrchestrator:
         if key in models and Path(models[key]).exists():
             return Path(models[key])
 
-        # Explicit path support for quick manual experiments.
         if artifact:
             p = Path(self._profile_artifact(profile))
             if p.exists():
@@ -1183,7 +1173,7 @@ class XTrimOrchestrator:
         tflite_models: Optional[Dict[str, Path]] = None,
         run_dir: Path,
     ) -> tuple[Dict[str, float], Dict[str, Any], str]:
-        """Benchmark an already exported deploy artifact without rebuilding it."""
+        """Измеряет задержку уже экспортированной deploy-модели без повторной сборки."""
         ensure_dir(run_dir)
         backend = str(self.latency_cfg.backend).lower().strip()
         profiles_active = bool(self._active_benchmark_profiles())
@@ -1365,10 +1355,14 @@ class XTrimOrchestrator:
         out: Dict[str, Path] = {}
         tdir = run_dir / "export" / "tflite"
         int8_name = str(getattr(self.export_cfg, "tflite_int8_name", "model_int8.tflite") or "model_int8.tflite")
+        fp32_name = str(getattr(self.export_cfg, "tflite_fp32_name", "model_fp32.tflite") or "model_fp32.tflite")
         fp16_name = str(getattr(self.export_cfg, "tflite_fp16_name", "model_fp16.tflite") or "model_fp16.tflite")
         candidates = {
             "int8": tdir / int8_name,
             "tflite_int8": tdir / int8_name,
+            "fp32": tdir / fp32_name,
+            "float32": tdir / fp32_name,
+            "tflite_fp32": tdir / fp32_name,
             "fp16": tdir / fp16_name,
             "tflite_fp16": tdir / fp16_name,
         }
@@ -1391,11 +1385,57 @@ class XTrimOrchestrator:
                 extra["tflite_artifact_size_bytes"] = sizes
         return artifacts
 
+    def _tflite_fp32_enabled(self) -> bool:
+        return bool(getattr(self.export_cfg, "tflite", False))
+
+    def _maybe_export_tflite_fp32_baseline(self, student: Any, run_dir: Path, extra: Dict[str, Any]) -> Optional[Path]:
+        """Создает FP32 TFLite-модель для исходной базовой модели."""
+        if not self._tflite_fp32_enabled():
+            return None
+        if self.export_tflite_fp32_fn_factory is None:
+            msg = "export_tflite_fp32_fn_factory is None"
+            extra["tflite_fp32_export"] = "skipped"
+            extra["tflite_fp32_skipped"] = msg
+            if bool(getattr(self.export_cfg, "tflite_fp32_required", False)):
+                raise RuntimeError(msg)
+            return None
+
+        tflite_name = str(getattr(self.export_cfg, "tflite_fp32_name", "model_fp32.tflite") or "model_fp32.tflite")
+        out = run_dir / "export" / "tflite" / tflite_name
+        try:
+            export_fn = self.export_tflite_fp32_fn_factory(student, self.export_cfg)
+            p = Path(export_fn(out))
+            if not p.exists():
+                raise RuntimeError(f"TFLite FP32 export did not create file: {p}")
+            extra["tflite_fp32_export"] = "ok"
+            extra["tflite_fp32_path"] = str(p)
+            extra["tflite_fp32_size_bytes"] = int(sizeof_file(p))
+            self._store_tflite_artifacts(run_dir, extra)
+            return p
+        except Exception as exc:
+            extra["tflite_fp32_export"] = "failed"
+            extra["tflite_fp32_failed"] = str(exc)
+            if bool(getattr(self.export_cfg, "tflite_fp32_required", False)):
+                raise
+            print(f"[warn] TFLite FP32 baseline export failed: {exc}", file=sys.stderr)
+            return None
+
+    @staticmethod
+    def _baseline_tflite_models_for_profiles(tflite_models: Optional[Dict[str, Path]]) -> Dict[str, Path]:
+        """Привязывает TFLite-профили базовой модели к одному FP32 .tflite-файлу."""
+        models = dict(tflite_models or {})
+        fp32 = models.get("fp32") or models.get("tflite_fp32") or models.get("float32")
+        if fp32 is None:
+            return models
+        for key in ("int8", "tflite_int8", "model_int8", "fp16", "tflite_fp16", "model_fp16"):
+            models.setdefault(key, fp32)
+        return models
+
     def _tflite_int8_enabled(self) -> bool:
         return bool(getattr(self.export_cfg, "tflite", False)) and bool(getattr(self.export_cfg, "tflite_int8", False))
 
     def _maybe_export_tflite_int8(self, student: Any, run_dir: Path, extra: Dict[str, Any]) -> Optional[Path]:
-        """Create an additional TFLite INT8 artifact without changing ONNX deploy selection."""
+        """Создает дополнительный TFLite INT8-файл, не меняя выбранную ONNX-модель."""
         if not self._tflite_int8_enabled():
             return None
         if self.export_tflite_int8_fn_factory is None:
@@ -1416,9 +1456,6 @@ class XTrimOrchestrator:
             extra["tflite_int8_export"] = "ok"
             extra["tflite_int8_path"] = str(p)
             extra["tflite_int8_size_bytes"] = int(sizeof_file(p))
-            # The same Ultralytics/onnx2tf export can also produce a stable
-            # model_fp16.tflite when export.tflite_fp16=true.  Record every
-            # copied artifact so benchmark_profiles can select them later.
             self._store_tflite_artifacts(run_dir, extra)
             return p
         except Exception as exc:
@@ -1437,7 +1474,7 @@ class XTrimOrchestrator:
 
     @staticmethod
     def _local_prune_ratio(prev_total: float, target_total: float) -> float:
-        """Convert cumulative pruning targets into a local ratio for the current model."""
+        """Переводит общий уровень прунинга в локальный шаг для текущей стадии."""
         prev = float(prev_total)
         target = float(target_total)
         if not (0.0 <= prev < 1.0):
@@ -1512,7 +1549,7 @@ class XTrimOrchestrator:
         final: Dict[str, Any],
         progress: float,
     ) -> Dict[str, int]:
-        """Move current widths toward final widths without undershooting the final target."""
+        """Плавно приближает текущие ширины каналов к целевым, не опускаясь ниже финального значения."""
         p = max(0.0, min(1.0, float(progress)))
         out: Dict[str, int] = {}
         for name, final_width in dict(final or {}).items():
@@ -1542,7 +1579,6 @@ class XTrimOrchestrator:
                 dict(final_arch.get("detect_hidden_channels", {}) or {}),
                 progress,
             ),
-            # During intermediate stages this is a width target, not an exact param target.
             "total_params": int(final_arch.get("total_params", 0) or 0),
         }
 
@@ -1800,10 +1836,6 @@ class XTrimOrchestrator:
             if isinstance(qat_logs, dict):
                 extra["qat_logs"] = qat_logs
 
-            # finetune_qat_recover() normally disables fake-quant at the end,
-            # but keep this explicit here so the exported QAT model is always
-            # a clean deploy candidate with trained weights, not a graph with
-            # training-time fake-quant operators accidentally left enabled.
             try:
                 from .quant.fake_quant_ultra import set_fake_quant_enabled
 
@@ -1841,11 +1873,6 @@ class XTrimOrchestrator:
         extra["deploy_onnx_path"] = str(deploy_onnx)
         extra["deploy_onnx_kind"] = deploy_onnx_kind
 
-        # Metric used for Pareto/scalar/history must describe the same artifact
-        # that is measured for size and latency. Previously metrics.acc stayed
-        # at the pre-QAT FP32 recovery score, while size/latency could belong
-        # to model_int8_after_qat.onnx. That made FINAL RESULTS and Pareto
-        # compare different deploy artifacts.
         deploy_acc_source = "acc_recovered_torch"
         if deploy_onnx_kind == "int8_after_qat" and "acc_onnx_int8_after_qat" in extra:
             deploy_acc_source = "acc_onnx_int8_after_qat"
@@ -1922,6 +1949,8 @@ class XTrimOrchestrator:
             latency_ms = self._bench_latency(ncnn_final.param, ncnn_final.bin, run_dir)
             extra["deploy_backend"] = "ncnn"
 
+        # Legacy NCNN demo. Current Android latency is measured through
+        # ONNX Runtime/TFLite benchmark profiles in the Android app.
         if self.android_demo_cfg.enabled and ncnn_final is not None:
             try:
                 for d in self.devices:

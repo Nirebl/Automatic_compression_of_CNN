@@ -71,7 +71,7 @@ def warmstart_noop(student: UltralyticsStudent) -> None:
 
 
 def _build_recalib_loader(model_cfg: ModelConfig, batch: int = 4, workers: int = 2, model_stride: int = 32):
-    """Build a minimal train data loader for BN recalibration."""
+    """Создает минимальный train dataloader для пересчета BatchNorm."""
     try:
         from ultralytics.data.utils import check_det_dataset
         from ultralytics.cfg import get_cfg
@@ -120,7 +120,7 @@ def extract_ultralytics_pruning_architecture(
     student: UltralyticsStudent,
     trim_cfg: TrimConfig,
 ) -> dict:
-    """Describe the structural widths that matter for pruning comparisons."""
+    """Описывает ширины каналов, важные для сравнения архитектур после прунинга."""
     torch_model = student.torch_model
     exclude_name_regex = _normalize_optional_regex(
         getattr(trim_cfg, "exclude_name_regex", None), "trim.exclude_name_regex"
@@ -248,7 +248,6 @@ def build_ultralytics_candidate(
     skip_inner_m = bool(getattr(trim_cfg, "skip_inner_m", True))
     skip_cv1_if_parent_has_m = bool(getattr(trim_cfg, "skip_cv1_if_parent_has_m", True))
     def _apply_composite_psa_pruning(stage_label: str, prune_ratio_value: float):
-        # PSA/Attention family in YOLO11 must be pruned atomically, not by individual inner convs.
         round_to = max(int(getattr(trim_cfg, "channel_round", 8) or 8), 8)
         min_ch = max(int(getattr(trim_cfg, "min_channels", 8) or 8), 8)
         stats = shrink_psa_family_blocks(
@@ -267,10 +266,6 @@ def build_ultralytics_candidate(
         return stats
 
     def _apply_detect_head_pruning(stage_label: str, prune_ratio_value: float):
-        # Важно: Detect-head должен подчиняться trim.exclude_head.
-        # Раньше structured_trim_yolo(...) голову пропускал, но этот дополнительный
-        # shrink_detect_heads(...) всё равно резал её после основного pruning. Из-за этого
-        # результаты для p=0.60/p=0.80 сильно проседали относительно старых запусков.
         if bool(getattr(trim_cfg, "exclude_head", True)):
             stats = {
                 "heads_shrunk": 0,
@@ -614,11 +609,9 @@ def apply_ultralytics_pruning_stage(
     stage_label: str,
     target_architecture: Optional[dict] = None,
 ) -> dict:
-    """Apply one additional BN-gamma pruning stage to an existing student.
+    """Выполняет один дополнительный шаг BN-gamma прунинга для существующей student-модели.
 
-    ``stage_prune_ratio`` is local to the *current* model, not cumulative with
-    respect to the original model. The orchestrator is responsible for turning
-    cumulative milestones into these local ratios.
+    stage_prune_ratio считается относительно текущей модели, а не относительно исходной.
     """
     import torch
 
@@ -1003,19 +996,9 @@ def _extract_box_attr(res: Any, attrs: tuple[str, ...]) -> Optional[float]:
 
 
 def _extract_detection_metrics(res: Any) -> dict[str, float]:
-    """Extract YOLO detection metrics from an Ultralytics val() result.
+    """Достает метрики детекции из результата Ultralytics val().
 
-    The returned keys are stable for the rest of the pipeline:
-    - map50_95: COCO-style mAP@[0.50:0.95], used as the main acc metric;
-    - precision: mean box precision;
-    - recall: mean box recall;
-    - iou: mean IoU for matched detections when provided by the evaluator;
-    - map50: mAP@0.50, kept in history for compatibility.
-
-    Note: standard Ultralytics detection validation does not always expose a
-    separate aggregate IoU metric. In that case the key is omitted and the
-    reporting table will show "---" unless a custom evaluator provides it.
-    Missing optional metrics are simply omitted instead of being forced to 0.
+    map50_95 используется как основная метрика качества. Precision, recall, IoU и map50 добавляются только если evaluator их вернул.
     """
     metrics: dict[str, float] = {}
 
@@ -1072,13 +1055,9 @@ def _extract_detection_metrics(res: Any) -> dict[str, float]:
     return metrics
 
 def _make_eval_yolo_copy(student: UltralyticsStudent, model_cfg: ModelConfig):
-    """
-    Build a throwaway YOLO wrapper around a deepcopy of the student model.
+    """Создает временную копию YOLO-модели для валидации.
 
-    Ultralytics validation routes PyTorch models through AutoBackend with fuse=True.
-    For end-to-end heads (YOLO26), model.fuse() removes the auxiliary one2many
-    branch needed for further training/QAT. Validation therefore must never run on
-    the live student object when the same model may be trained again later.
+    Это защищает исходную student-модель от изменений, которые Ultralytics может внести во время val().
     """
     from ultralytics import YOLO
 
@@ -1095,9 +1074,6 @@ def _make_eval_yolo_copy(student: UltralyticsStudent, model_cfg: ModelConfig):
 
 
 def eval_ultralytics_metrics(student: UltralyticsStudent, model_cfg: ModelConfig, eval_cfg: EvalConfig) -> dict[str, float]:
-    # Important for YOLO26: val() may fuse a PyTorch model in-place, which removes
-    # one2many from an end-to-end Detect head. Evaluate a deepcopy and keep the
-    # original student trainable for possible QAT recovery.
     eval_yolo = _make_eval_yolo_copy(student, model_cfg)
     res = eval_yolo.val(**_val_kwargs(model_cfg, eval_cfg))
     return _extract_detection_metrics(res)
@@ -1123,10 +1099,9 @@ def make_ultralytics_export_onnx_fn(
     model_cfg: ModelConfig,
     export_cfg: ExportConfig,
 ) -> Callable[[Path], None]:
-    """
-    Экспорт ONNX без yolo.export(), но ВАЖНО:
-    - форсим legacy exporter (dynamo=False), чтобы не падать на torch.export
-      на некоторых pruned-моделях.
+    """Создает функцию экспорта YOLO-модели в ONNX.
+
+    Используется legacy exporter, потому что он стабильнее работает с pruned-моделями.
     """
 
     def _export(onnx_path: Path) -> None:
@@ -1254,20 +1229,119 @@ def _find_tflite_file(root: Path) -> Optional[Path]:
 
 
 def _find_tflite_file_by_priority(root: Path, priority_words: tuple[str, ...]) -> Optional[Path]:
-    files = list(root.rglob("*.tflite"))
+    """Ищет TFLite-файл по строгому порядку приоритета.
+
+    Это важно, потому что конвертер может создать несколько похожих .tflite-файлов, но для INT8 нужен именно проверенный вариант.
+    """
+    files = sorted(root.rglob("*.tflite"), key=lambda p: (len(p.parts), str(p)))
     if not files:
         return None
 
-    def score(path: Path) -> tuple[int, int, str]:
-        text = path.name.lower()
-        value = 0
-        for i, word in enumerate(priority_words):
-            if word.lower() in text:
-                value += 100 - i
-        return (-value, len(path.parts), str(path))
+    for word in priority_words:
+        needle = str(word).lower()
+        for path in files:
+            if needle in path.name.lower():
+                return path
 
-    files.sort(key=score)
     return files[0]
+
+
+def make_ultralytics_export_tflite_fp32_fn(
+    student: "UltralyticsStudent",
+    model_cfg: ModelConfig,
+    export_cfg: ExportConfig,
+) -> Callable[[Path], Path]:
+    """Создает функцию экспорта текущей модели в FP32 TFLite.
+
+    Этот путь используется для исходной baseline-модели без INT8 и FP16 преобразований.
+    """
+
+    def _export(tflite_path: Path) -> Path:
+        import os
+        import shutil
+        import tempfile
+
+        from ultralytics import YOLO
+
+        ensure_dir(tflite_path.parent)
+        if tflite_path.exists():
+            tflite_path.unlink()
+
+        old_cwd = Path.cwd()
+        export_device = str(getattr(export_cfg, "tflite_int8_device", "cpu") or "cpu")
+        simplify = bool(getattr(export_cfg, "tflite_int8_simplify", False))
+
+        with tempfile.TemporaryDirectory(prefix="xtrim_tflite_fp32_", dir=str(tflite_path.parent)) as tmp:
+            tmp_dir = Path(tmp)
+            tmp_pt = tmp_dir / "xtrim_tflite_export_fp32.pt"
+
+            try:
+                from ..quant.fake_quant_ultra import unpatch_ultralytics_convs_for_fake_quant
+
+                restored = unpatch_ultralytics_convs_for_fake_quant(student.torch_model)
+                if restored:
+                    print(f"[tflite] restored fake-quant patched Conv.forward in {restored} modules before FP32 export")
+            except Exception as exc:
+                print(f"[tflite] warning: could not restore fake-quant Conv.forward hooks before FP32 export: {exc}")
+
+            try:
+                student.yolo.save(str(tmp_pt))
+            except Exception as exc:
+                raise RuntimeError(f"Could not save temporary YOLO checkpoint for TFLite FP32 export: {exc}") from exc
+            if not tmp_pt.exists():
+                raise RuntimeError(f"Temporary YOLO checkpoint was not created: {tmp_pt}")
+
+            export_yolo = YOLO(str(tmp_pt))
+            try:
+                os.chdir(tmp_dir)
+                result = export_yolo.export(
+                    format="tflite",
+                    imgsz=int(model_cfg.imgsz),
+                    int8=False,
+                    half=False,
+                    data=str(model_cfg.data),
+                    batch=1,
+                    device=export_device,
+                    nms=False,
+                    simplify=simplify,
+                )
+            finally:
+                os.chdir(old_cwd)
+
+            def _looks_fp32(path: Path) -> bool:
+                name = path.name.lower()
+                blocked = ("int8", "quant", "integer", "fp16", "float16", "half")
+                return path.suffix.lower() == ".tflite" and not any(x in name for x in blocked)
+
+            files = sorted(tmp_dir.rglob("*.tflite"), key=lambda p: (len(p.parts), str(p)))
+            src = next((f for f in files if _looks_fp32(f)), None)
+
+            if src is None and result is not None:
+                rp = Path(str(result))
+                if not rp.is_absolute():
+                    rp = tmp_dir / rp
+                if rp.is_file() and _looks_fp32(rp):
+                    src = rp
+                elif rp.is_dir():
+                    nested = sorted(rp.rglob("*.tflite"), key=lambda p: (len(p.parts), str(p)))
+                    src = next((f for f in nested if _looks_fp32(f)), None)
+
+            if src is None:
+                src = _find_tflite_file(tmp_dir)
+
+            if src is None or not src.exists():
+                raise RuntimeError(
+                    "Ultralytics TFLite FP32 export finished but no .tflite file was found "
+                    f"under temporary export directory: {tmp_dir}"
+                )
+
+            shutil.copy2(src, tflite_path)
+
+        if not tflite_path.exists():
+            raise RuntimeError(f"TFLite FP32 export did not create file: {tflite_path}")
+        return tflite_path
+
+    return _export
 
 
 def make_ultralytics_export_tflite_int8_fn(
@@ -1275,19 +1349,9 @@ def make_ultralytics_export_tflite_int8_fn(
     model_cfg: ModelConfig,
     export_cfg: ExportConfig,
 ) -> Callable[[Path], Path]:
-    """Return a callable that exports the current model to INT8 TFLite.
+    """Создает функцию экспорта текущей модели в INT8 TFLite.
 
-    The important detail is that the export is performed from a temporary .pt
-    checkpoint saved inside the candidate run directory. This avoids the older
-    behavior where Ultralytics tried to create/use ``best.onnx`` next to the
-    original source checkpoint (for example inside ``coco_baselines/...``),
-    which made TFLite export fail even though the pipeline's own
-    ``run_dir/export/model.onnx`` was already available.
-
-    The TFLite export is forced to CPU by default. ``model.device`` still
-    controls PyTorch training/validation, but TensorFlow/TFLite conversion does
-    not benefit from selecting CUDA here and Ultralytics may otherwise try to
-    install/use ``onnxruntime-gpu`` during export.
+    Экспорт идет из временного .pt checkpoint внутри папки кандидата. Это не дает Ultralytics искать файлы рядом с исходным checkpoint и делает результат воспроизводимее.
     """
 
     def _export(tflite_path: Path) -> Path:
@@ -1309,16 +1373,6 @@ def make_ultralytics_export_tflite_int8_fn(
             tmp_dir = Path(tmp)
             tmp_pt = tmp_dir / "xtrim_tflite_export.pt"
 
-            # Save a self-contained checkpoint of the current pruned/recovered
-            # Ultralytics model and reload it. Calling export() on student.yolo
-            # directly may reuse the original .pt path and make Ultralytics look
-            # for <original>/best.onnx instead of using this candidate's files.
-            #
-            # Important for QAT candidates: fake quantization temporarily
-            # monkey-patches Ultralytics Conv.forward. If such a module is saved
-            # as-is and later reloaded, TFLite export may fail with
-            # "'Conv' object has no attribute '_forward'". Restore the original
-            # class-level forward before saving the temporary checkpoint.
             try:
                 from ..quant.fake_quant_ultra import unpatch_ultralytics_convs_for_fake_quant
 
@@ -1351,20 +1405,15 @@ def make_ultralytics_export_tflite_int8_fn(
             finally:
                 os.chdir(old_cwd)
 
-            # onnx2tf/Ultralytics often creates several .tflite variants in
-            # the temporary export directory.  Select the actual full-integer
-            # variant for model_int8.tflite and optionally copy float16 for the
-            # GPU-delegate benchmark.
             int8_priority = (
+                "_int8.tflite",
+                "int8",
                 "full_integer_quant",
                 "integer_quant",
-                "int8",
                 "quant",
             )
             src = _find_tflite_file_by_priority(tmp_dir, int8_priority)
 
-            # If Ultralytics returned a concrete .tflite file, still consider it
-            # only as a fallback.  Some versions return float32/float16 first.
             if src is None and result is not None:
                 rp = Path(str(result))
                 if not rp.is_absolute():
@@ -1403,8 +1452,6 @@ def save_student_torchscript(student: UltralyticsStudent, pt_path: Path) -> None
     try:
         scripted = torch.jit.script(student.torch_model)
     except (OSError, RuntimeError):
-        # Dynamically-created test models and some wrapped runtime modules have no
-        # inspectable Python source, so scripting may fail even when tracing is fine.
         first_param = next(student.torch_model.parameters(), None)
         dev = first_param.device if first_param is not None else torch.device("cpu")
         dt = first_param.dtype if first_param is not None else torch.float32

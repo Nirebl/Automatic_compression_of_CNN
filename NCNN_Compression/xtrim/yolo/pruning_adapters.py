@@ -29,8 +29,6 @@ except Exception:
 
 PSA_FAMILY_CLASSNAMES = {
     "Attention", "PSABlock", "PSA", "C2PSA", "C2fPSA",
-    # xtrim pruning adapters. These classes preserve PSA/C2PSA split/chunk
-    # invariants and must be handled atomically, not by generic Conv pruning.
     "PSABlockPrunable", "PSAPrunable", "C2PSAPrunable", "C2fPSAPrunable",
 }
 
@@ -68,13 +66,9 @@ def _c2f_like_kind(m: nn.Module) -> str:
 
 
 class C2fPrunable(nn.Module):
-    """
-    Pruning-friendly replacement for Ultralytics C2f/C3k2-like blocks.
+    """Замена C2f/C3k2-подобных блоков Ultralytics, удобная для структурного прунинга.
 
-    Вместо:
-        cv1(x) -> split((c, c)) -> ...
-    делаем две явные ветки:
-        cv0(x), cv1(x)
+    Вместо split внутри одного Conv используются две явные ветки, поэтому каналы можно безопаснее удалять.
     """
 
     def __init__(
@@ -124,20 +118,9 @@ class C2fPrunable(nn.Module):
         return self.forward(x)
 
 
-# -----------------------------
-# PSA-family prunable classes
-# -----------------------------
 
 def _safe_num_heads(dim: int, preferred_heads: Optional[int] = None, min_head_dim: int = 8) -> int:
-    """
-    Safely choose a valid number of heads for Attention(dim, num_heads=...).
-
-    Правила:
-    - num_heads >= 1
-    - dim % num_heads == 0
-    - стараемся сохранить число голов не больше старого preferred_heads
-    - стараемся не делать слишком маленький head_dim
-    """
+    """Подбирает допустимое число attention-heads после изменения ширины канала."""
     dim = int(dim)
     if dim <= 0:
         return 1
@@ -147,12 +130,10 @@ def _safe_num_heads(dim: int, preferred_heads: Optional[int] = None, min_head_di
 
     preferred_heads = max(1, min(int(preferred_heads), dim))
 
-    # Сначала ищем делитель, где head_dim не слишком маленький
     for h in range(preferred_heads, 0, -1):
         if dim % h == 0 and (dim // h) >= int(min_head_dim):
             return h
 
-    # Потом любой делитель
     for h in range(preferred_heads, 0, -1):
         if dim % h == 0:
             return h
@@ -161,9 +142,7 @@ def _safe_num_heads(dim: int, preferred_heads: Optional[int] = None, min_head_di
 
 
 class PSABlockPrunable(nn.Module):
-    """
-    Pruning-friendly analogue of Ultralytics PSABlock.
-    """
+    """PSABlock, адаптированный для безопасного прунинга."""
     def __init__(
         self,
         c: int,
@@ -191,9 +170,7 @@ class PSABlockPrunable(nn.Module):
 
 
 class PSAPrunable(nn.Module):
-    """
-    Pruning-friendly analogue of Ultralytics PSA.
-    """
+    """PSA-блок, адаптированный для безопасного прунинга."""
     def __init__(self, c1: int, c2: int, e: float = 0.5):
         super().__init__()
         self.c = int(c1 * e)
@@ -216,9 +193,7 @@ class PSAPrunable(nn.Module):
 
 
 class C2PSAPrunable(nn.Module):
-    """
-    Pruning-friendly analogue of Ultralytics C2PSA.
-    """
+    """C2PSA-блок, адаптированный для безопасного прунинга."""
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
         super().__init__()
         assert c1 == c2
@@ -239,9 +214,7 @@ class C2PSAPrunable(nn.Module):
 
 
 class C2fPSAPrunable(nn.Module):
-    """
-    Pruning-friendly analogue of Ultralytics C2fPSA.
-    """
+    """C2fPSA-блок, адаптированный для безопасного прунинга."""
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
         super().__init__()
         self.c = int(c2 * e)
@@ -261,9 +234,6 @@ class C2fPSAPrunable(nn.Module):
         return self.cv2(torch.cat(y, 1))
 
 
-# -----------------------------
-# Copy helpers
-# -----------------------------
 
 def _copy_conv_bn_(
     dst: Any,
@@ -273,15 +243,9 @@ def _copy_conv_bn_(
     out_idx: Optional[Sequence[int]] = None,
     in_idx: Optional[Sequence[int]] = None,
 ) -> None:
-    """
-    Copy Ultralytics Conv() + BN with optional output/input slicing.
-    Supports:
-      - standard conv
-      - depthwise conv (groups == in_channels == out_channels, weight shape [C, 1, k, k])
+    """Копирует Conv + BatchNorm из Ultralytics, оставляя только выбранные каналы.
 
-    Important:
-      - for depthwise conv we NEVER index input-channel dim, because it is always size 1
-      - grouped non-depthwise conv is not safely supported by arbitrary in_idx pruning here
+    Depthwise Conv обрабатывается отдельно: у него входная размерность равна 1, поэтому ее нельзя индексировать как обычные каналы.
     """
     with torch.no_grad():
         src_conv = src.conv
@@ -299,21 +263,14 @@ def _copy_conv_bn_(
         )
         is_grouped = src_conv.groups > 1 and not is_depthwise
 
-        # output channel selection is always valid
         if out_slice is not None:
             w = w[out_slice].clone()
         if out_idx is not None:
             idx = torch.as_tensor(list(out_idx), device=w.device, dtype=torch.long)
             w = w.index_select(0, idx).clone()
 
-        # input channel selection:
-        # - standard conv: allowed
-        # - depthwise conv: NEVER index dim=1 (it is 1)
-        # - grouped non-depthwise: reject for now, unless no input pruning requested
         if in_slice is not None or in_idx is not None:
             if is_depthwise:
-                # For depthwise conv, selecting output channels already selects the corresponding channel groups.
-                # Input dim stays 1 and must not be indexed.
                 pass
             elif is_grouped:
                 raise NotImplementedError(
@@ -384,9 +341,6 @@ def _contains_psa_family(module: nn.Module) -> bool:
     return False
 
 
-# -----------------------------
-# C2f/C3k2 adapter
-# -----------------------------
 
 def convert_c2f_to_prunable(c2f: Any, *, verbose: bool = False) -> C2fPrunable:
     if not isinstance(c2f, C2f):
@@ -427,22 +381,15 @@ def convert_c2f_to_prunable(c2f: Any, *, verbose: bool = False) -> C2fPrunable:
     repl.m = copy.deepcopy(c2f.m)
     repl.m.to(device=c2f.cv1.conv.weight.device, dtype=c2f.cv1.conv.weight.dtype)
 
-    # Nested C2f/C3k2 are adapted too. PSA-family is handled separately.
     replace_c2f_with_prunable(repl.m, verbose=verbose)
 
     return repl
 
 
 def replace_c2f_with_prunable(module: nn.Module, verbose: bool = True) -> int:
-    """
-    Replace only real C2f/C3k2 blocks with C2fPrunable.
-    C2fPSA is handled separately by the composite PSA shrink path.
+    """Заменяет C2f/C3k2-блоки на C2fPrunable.
 
-    Important:
-    - If a C2f/C3k2 carrier contains PSA-family submodules, we still adapt it to
-      C2fPrunable, but later the generic channel-pruning path must skip its carrier
-      convs (cv0/cv1/cv2) and let the composite PSA pruner handle the inner PSA
-      blocks atomically.
+    C2fPSA и PSA-семейство обрабатываются отдельно, потому что их внутренние связи нужно сжимать атомарно.
     """
     replaced = 0
     for name, child in list(module.named_children()):
@@ -459,9 +406,6 @@ def replace_c2f_with_prunable(module: nn.Module, verbose: bool = True) -> int:
     return replaced
 
 
-# -----------------------------
-# Composite PSA-family shrinking
-# -----------------------------
 
 def _topk_indices(vec: torch.Tensor, k: int) -> List[int]:
     k = int(max(0, min(k, int(vec.numel()))))
@@ -547,7 +491,6 @@ def _shrink_attention(attn: Any, keep_hidden: Sequence[int]) -> Any:
     q_keep = _topk_indices(q_imp, new_q)
     k_keep = _topk_indices(k_imp, new_k)
 
-    # Для V и proj сохраняем каналы, согласованные с keep_hidden
     v_keep = list(keep_hidden[:new_v])
 
     qkv_out_idx = q_keep + [old_q + i for i in k_keep] + [old_q + old_k + i for i in v_keep]
@@ -774,11 +717,6 @@ def _shrink_composite_module(
 ) -> Tuple[Any, Optional[Dict[str, int]]]:
     name = _class_name(module)
 
-    # IMPORTANT:
-    # Do NOT shrink bare PSABlock here.
-    # A standalone PSABlock may live inside a larger carrier/container
-    # whose surrounding convs are still unchanged. Replacing only the block
-    # breaks input channel compatibility (e.g. block expects 56, parent still feeds 256).
     if name in {"PSA", "PSAPrunable"}:
         return _shrink_psa(module, prune_ratio, round_to, min_channels)
     if name in {"C2PSA", "C2PSAPrunable"}:
@@ -797,10 +735,7 @@ def shrink_psa_family_blocks(
     min_channels: int = 8,
     verbose: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Prune PSA-family blocks atomically instead of pruning their internal convs independently.
-    This removes the need for regex exclusions like ".attn."/".ffn.".
-    """
+    """Сжимает PSA-семейство блоков целиком, а не отдельными внутренними Conv-слоями."""
     items: List[Dict[str, Any]] = []
     replaced = 0
 

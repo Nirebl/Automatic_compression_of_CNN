@@ -91,7 +91,6 @@ def _score_path(path: Path, words: Iterable[str]) -> tuple[int, int, str]:
     for i, word in enumerate(words):
         if word in text:
             score += 100 - i
-    # Prefer deeper/specific artifacts over random root files when scores tie.
     return (-score, -len(path.parts), str(path))
 
 
@@ -164,6 +163,7 @@ def _find_existing_tflite_models(candidate_dir: Path, extra: dict[str, Any], sou
 
     for key, aliases in {
         "int8": ("tflite_int8_path", "model_int8.tflite", "full_integer_quant", "integer_quant", "int8"),
+        "fp32": ("tflite_fp32_path", "model_fp32.tflite", "float32", "fp32"),
         "fp16": ("tflite_fp16_path", "model_fp16.tflite", "float16", "fp16"),
     }.items():
         if key in models:
@@ -178,7 +178,6 @@ def _find_existing_tflite_models(candidate_dir: Path, extra: dict[str, Any], sou
         files = list(candidate_dir.rglob("*.tflite"))
         if not files:
             continue
-        # Prefer stable copied filenames, then converter-specific names.
         priority = tuple(str(x) for x in aliases[1:])
         files.sort(key=lambda p: _score_path(p, priority))
         best = files[0]
@@ -187,6 +186,9 @@ def _find_existing_tflite_models(candidate_dir: Path, extra: dict[str, Any], sou
 
     if "int8" in models:
         models.setdefault("tflite_int8", models["int8"])
+    if "fp32" in models:
+        models.setdefault("float32", models["fp32"])
+        models.setdefault("tflite_fp32", models["fp32"])
     if "fp16" in models:
         models.setdefault("tflite_fp16", models["fp16"])
     return models
@@ -194,11 +196,7 @@ def _find_existing_tflite_models(candidate_dir: Path, extra: dict[str, Any], sou
 
 
 def _find_existing_ncnn_source_onnx(candidate_dir: Path, extra: dict[str, Any], source_root: Path) -> Optional[Path]:
-    """Find a FP32/QAT-FP32 ONNX file suitable for onnx2ncnn.
-
-    Deploy ONNX may be INT8/QDQ. That is fine for ORT, but it is not the safest
-    source for NCNN conversion. Prefer model_qat.onnx or model.onnx.
-    """
+    """Ищет FP32 или QAT-FP32 ONNX-файл, который безопаснее использовать как источник для NCNN."""
     for key in (
         "ncnn_source_onnx_path",
         "deploy_onnx_qat_path",
@@ -264,7 +262,6 @@ def _history_from_dirs(source_root: Path) -> list[HistoryItem]:
 def _is_failed_or_non_deploy(item: HistoryItem) -> bool:
     if item.extra.get("failed"):
         return True
-    # Keep reference baseline and real candidates. Skip other helper/history rows.
     if item.extra.get("search_excluded") and not item.extra.get("is_reference_baseline"):
         return True
     return False
@@ -294,11 +291,9 @@ def rebench_existing(
     source_run_dir: str | Path | None = None,
     out_root: str | Path | None = None,
 ) -> list[HistoryItem]:
-    """Re-runs latency benchmarks for already generated artifacts.
+    """Повторно измеряет задержку для уже созданных моделей.
 
-    No pruning, no training, no QAT, no PTQ and no export are performed.
-    The returned history keeps the original accuracy/size metrics and replaces
-    only latency fields with fresh measurements from the current config.
+    Прунинг, обучение, QAT, PTQ и экспорт не запускаются. Точность и размер берутся из старой истории, а задержка измеряется заново.
     """
     source_root = Path(source_run_dir or run_dir or "").resolve()
     if not source_root.exists():
@@ -308,7 +303,6 @@ def rebench_existing(
     ensure_dir(output_root)
     ensure_dir(output_root / "history")
 
-    # Make sure stale latency cache is not reused during rebench.
     try:
         orchestrator.latency_cfg = dataclasses.replace(orchestrator.latency_cfg, use_cache=False, force_rebench=True)
     except Exception:
@@ -324,8 +318,6 @@ def rebench_existing(
     try:
         orchestrator.prepare_benchmark_devices()
     except AttributeError:
-        # Older orchestrators did not expose the method.  The explicit benchmark
-        # method below will still check devices through the concrete backends.
         pass
 
     source_history_path = source_root / "history.jsonl"
@@ -338,7 +330,6 @@ def rebench_existing(
         print(f"[rebench] No deployable candidates found in: {source_root}")
         return []
 
-    # Fresh output history for this rebench run.
     out_history = output_root / "history.jsonl"
     if out_history.exists():
         archive = output_root / "history" / f"previous_rebench_{int(time.time())}.jsonl"
@@ -373,11 +364,9 @@ def rebench_existing(
         ncnn_param, ncnn_bin = _find_existing_ncnn_pair(source_artifacts_dir, item.extra, source_root)
         onnx_model = _find_existing_onnx(source_artifacts_dir, item.extra, source_root)
         tflite_models = _find_existing_tflite_models(source_artifacts_dir, item.extra, source_root)
+        if item.extra.get("is_reference_baseline") and ("fp32" in tflite_models or "tflite_fp32" in tflite_models):
+            tflite_models = orchestrator._baseline_tflite_models_for_profiles(tflite_models)
 
-        # If the original run saved only ONNX artifacts, a rebench config can
-        # still add NCNN CPU/Vulkan profiles. Generate NCNN from a FP32/QAT-FP32
-        # ONNX source in the rebench output directory instead of touching the
-        # old run.
         generated_ncnn_extra: dict[str, Any] = {}
         try:
             needs_ncnn = bool(orchestrator._needs_ncnn_artifact())
@@ -485,7 +474,6 @@ def rebench_existing(
             )
             print(f"[rebench] FAILED {tag}: {exc}")
 
-    # Save a machine-readable rebench log and Pareto set for the new latency measurements.
     rebench_results = output_root / "rebench_results.jsonl"
     with rebench_results.open("w", encoding="utf-8") as f:
         for row in rows:

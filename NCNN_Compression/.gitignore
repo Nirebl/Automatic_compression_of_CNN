@@ -36,4 +36,8 @@ Thumbs.db
 
 # Project-generated outputs
 /outputs/
+/outputs_old/
 /runs/
+/coco_baselines/
+/.venv2/
+/Datasets/

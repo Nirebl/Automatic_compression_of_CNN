@@ -72,8 +72,6 @@ class AndroidAppBench:
 
         self.adb(device.serial, "push", str(local_image_list), remote_image_list)
         try:
-            # Directory must stay executable/traversable for the Android app.
-            # chmod -R 644 would make the directory unreadable as a directory.
             self.adb(device.serial, "shell", f"chmod 755 {remote_images_dir} && chmod 644 {remote_images_dir}/*")
         except Exception as e:
             print(e)
@@ -163,8 +161,6 @@ class AndroidAppBench:
             "--es", "bin", rbin,
             "--es", "dataset", str(cfg.dataset),
             "--es", "run_id", run_id,
-            # Runtime is consumed by the updated Android CliBenchActivity.
-            # device/gpu_device are also passed for backward-compatible builds.
             "--es", "runtime", runtime,
             "--es", "backend", runtime,
             "--ei", "device", str(int(gpu_device)),
@@ -202,8 +198,6 @@ class AndroidAppBench:
                 if "run_id" in data and str(data["run_id"]) != run_id:
                     time.sleep(float(cfg.poll_interval_sec))
                     continue
-                # Older Android app builds may not echo these fields yet.
-                # Add them on the Python side so logs and history remain explicit.
                 data.setdefault("runtime", runtime)
                 data.setdefault("backend", runtime)
                 data.setdefault("use_gpu", runtime == "ncnn_vulkan")

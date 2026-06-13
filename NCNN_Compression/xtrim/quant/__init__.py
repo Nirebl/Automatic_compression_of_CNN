@@ -8,7 +8,7 @@ from .fake_quant_ultra import (
 
 
 def ort_static_quantize_yolo(*args, **kwargs):
-    """Import ONNX Runtime quantization only when the feature is actually used."""
+    """Загружает квантование ONNX Runtime только при реальном вызове."""
     from .ort_ptq import ort_static_quantize_yolo as _ort_static_quantize_yolo
 
     return _ort_static_quantize_yolo(*args, **kwargs)

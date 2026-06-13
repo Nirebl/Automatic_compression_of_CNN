@@ -75,18 +75,26 @@ def test_orchestrator_resume_does_not_duplicate_reference_baseline(make_orchestr
     assert second[0].candidate.tag == "baseline_raw"
 
 
-def test_orchestrator_exports_optional_tflite_int8_artifact(make_orchestrator):
+def test_orchestrator_exports_baseline_tflite_fp32_and_candidate_tflite_int8(make_orchestrator):
     from xtrim.types import ExportConfig
 
-    def tflite_factory(_student, _cfg):
+    def tflite_int8_factory(_student, _cfg):
         def _export(path: Path) -> Path:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"fake-tflite-int8")
             return path
         return _export
 
+    def tflite_fp32_factory(_student, _cfg):
+        def _export(path: Path) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"fake-tflite-fp32")
+            return path
+        return _export
+
     orch = make_orchestrator(
-        export_tflite_int8_fn_factory=tflite_factory,
+        export_tflite_int8_fn_factory=tflite_int8_factory,
+        export_tflite_fp32_fn_factory=tflite_fp32_factory,
     )
     orch.export_cfg = ExportConfig(tflite=True, tflite_int8=True)
 
@@ -94,7 +102,11 @@ def test_orchestrator_exports_optional_tflite_int8_artifact(make_orchestrator):
     baseline = history[0]
     candidate = history[1]
 
-    assert baseline.extra["tflite_int8_export"] == "ok"
+    assert baseline.extra["tflite_fp32_export"] == "ok"
+    assert "tflite_int8_export" not in baseline.extra
+    assert Path(baseline.extra["tflite_fp32_path"]).exists()
+    assert baseline.extra["deploy_size_bytes_by_backend"]["tflite_fp32"] == len(b"fake-tflite-fp32")
+
     assert candidate.extra["tflite_int8_export"] == "ok"
     assert Path(candidate.extra["tflite_int8_path"]).exists()
     assert candidate.extra["deploy_size_bytes_by_backend"]["tflite_int8"] == len(b"fake-tflite-int8")

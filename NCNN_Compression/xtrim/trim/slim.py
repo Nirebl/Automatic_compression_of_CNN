@@ -57,8 +57,6 @@ def _is_original_c2f_like_parent(m: Any) -> bool:
 
 PSA_FAMILY_CLASSNAMES = {
     "Attention", "PSABlock", "PSA", "C2PSA", "C2fPSA",
-    # xtrim pruning adapters. These classes preserve PSA/C2PSA split/chunk
-    # invariants and must be handled atomically, not by generic Conv pruning.
     "PSABlockPrunable", "PSAPrunable", "C2PSAPrunable", "C2fPSAPrunable",
 }
 DETECT_FAMILY_CLASSNAMES = {"Detect"}
@@ -99,9 +97,6 @@ def _skip_reason(
         if include_inner_re is None or not include_inner_re.search(name):
             return "skip_inner_m"
 
-    # NEW:
-    # If ANY ancestor belongs to an adapted carrier that contains PSA-family blocks,
-    # do not prune this conv with the generic channel-pruning path.
     parts = name.split(".")
     for i in range(len(parts) - 1, 0, -1):
         qn = ".".join(parts[:i])
@@ -206,7 +201,7 @@ def collect_prunable_out_channels(
     skip_cv1_if_parent_has_m: bool = True,
     include_inner_m_regex: Optional[str] = None,
 ) -> Dict[str, int]:
-    """Return current output widths for the generic structurally-prunable Conv modules."""
+    """Возвращает текущие ширины выходных каналов для Conv-модулей, которые можно прунить."""
     return {
         name: int(getattr(m, "conv").out_channels)
         for name, m in _collect_prunable_convs(
@@ -228,7 +223,7 @@ def _select_prune_idxs_to_keep_count(
     importance_mode: str = "bn_gamma",
     conv: Optional[Any] = None,
 ) -> List[int]:
-    """Select channels to prune so that exactly ``target_keep`` outputs remain."""
+    """Выбирает каналы для удаления так, чтобы осталось ровно target_keep выходов."""
     import torch
 
     if importance_mode == "uniform" and conv is not None:
@@ -413,9 +408,6 @@ def _build_dependency_graph(tp, torch_model, example_input):
         if not ts:
             return out
 
-        # ВАЖНО:
-        # dependency graph должен зависеть от ВСЕХ выходных веток модели,
-        # а не только от самого большого тензора.
         acc = None
         for t in ts:
             if not torch.is_floating_point(t):
@@ -470,13 +462,9 @@ def _forward_check(torch_model, example_input):
 
 
 def _validate_c2f_like_invariants(torch_model: Any) -> None:
-    """
-    У оригинальных C2f/C3k2-like блоков инвариант жёсткий:
-        cv1.out_channels == 2 * self.c
-    Если нарушить его pruning'ом, следующий forward упадёт на split/chunk.
+    """Проверяет, что обычные C2f/C3k2-like блоки не были сломаны прунингом.
 
-    Для адаптированного C2fPrunable этот инвариант не обязателен,
-    поэтому проверяем только неадаптированные блоки.
+    Для таких блоков cv1.out_channels должен равняться 2 * self.c. Адаптированные C2fPrunable-блоки проверять не нужно.
     """
     import torch
 
@@ -663,9 +651,6 @@ def structured_trim_yolo(
             for i, (n, s, r) in enumerate(rep["top_skipped"], 1):
                 print(f"  [{i:02d}] {n:<40} {s:,}  reason={r}")
 
-    # Снимок на старте нужен только для:
-    # 1) списка имён
-    # 2) глобального порога по BN-gamma
     initial_prunable = _collect_prunable_convs(
         torch_model,
         exclude_head=exclude_head,
@@ -707,7 +692,6 @@ def structured_trim_yolo(
     pruned_layer_names: List[str] = []
 
     for name in prunable_names:
-        # Всегда берём АКТУАЛЬНЫЙ модуль из текущей модели, а не старую ссылку
         try:
             m = _get_module_by_qualname(torch_model, name)
         except Exception:
@@ -791,13 +775,11 @@ def structured_trim_yolo(
         if verbose:
             print(f"[trim] {name}: prune {len(idxs)}/{conv.out_channels} out-ch")
 
-        # Проверяем наличие root в актуальном dependency graph
         if hasattr(dg, "module2node") and root_module not in dg.module2node:
             if verbose:
                 print(f"[trim] {name}: root conv is not in dependency graph, rebuilding DG")
             dg = _build_dependency_graph(tp, torch_model, example_input)
 
-            # После rebuild нужно заново взять актуальный модуль и root
             try:
                 m = _get_module_by_qualname(torch_model, name)
             except Exception:
@@ -835,7 +817,6 @@ def structured_trim_yolo(
                     print(f"[trim] skip {name}: unsupported conv after rebuild")
                 continue
 
-            # Пересчитываем idxs на АКТУАЛЬНОМ bn/conv
             if name in target_out_channels:
                 idxs = _select_prune_idxs_to_keep_count(
                     bn,

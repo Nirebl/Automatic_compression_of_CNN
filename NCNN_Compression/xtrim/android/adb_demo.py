@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""Legacy NCNN demo runner. Current Android benchmarks use the app through ADB."""
+
 import subprocess
 from pathlib import Path
 from typing import Optional

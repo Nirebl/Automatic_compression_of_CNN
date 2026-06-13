@@ -11,10 +11,9 @@ from .utils import ensure_dir
 
 @dataclass(frozen=True)
 class AndroidDatasetSubset:
-    """Local dataset subset prepared for Android latency benchmarking.
+    """Набор изображений, подготовленный для замера задержки на Android.
 
-    local_dir contains copied image files with stable short names.
-    local_list contains remote Android paths, i.e. paths after adb push.
+    local_dir хранит локальные копии изображений, а local_list — пути, которые будут переданы приложению на устройстве.
     """
 
     local_dir: Path
@@ -42,10 +41,9 @@ def prepare_android_dataset_subset(
     remote_dir: str,
     remote_subdir: str = "xtrim_bench_images",
 ) -> AndroidDatasetSubset:
-    """Build a small deterministic image subset and list for Android benchmark.
+    """Собирает небольшой фиксированный набор изображений для Android-бенчмарка.
 
-    The source image list is resolved through Ultralytics' check_det_dataset(), so
-    regular dataset YAMLs such as coco128.yaml, VisDrone.yaml, or coco.yaml work.
+    Список исходных изображений читается через Ultralytics check_det_dataset(), поэтому можно использовать обычные YAML-файлы датасетов.
     """
 
     ensure_dir(out_dir)

@@ -230,6 +230,7 @@ def test_ultralytics_io_build_candidate_gumbel_conflict_and_warning_paths(monkey
 
 
 def test_ultralytics_io_finetune_eval_export_and_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     uio, YOLO, TinyUltraModel, store = _import_uio(monkeypatch)
     y = YOLO("w")
     student = uio.UltralyticsStudent(yolo=y, torch_model=y.model)
@@ -283,6 +284,151 @@ def test_ultralytics_io_finetune_eval_export_and_metadata(monkeypatch, tmp_path)
     assert json.loads(meta["names"])["0"] == "cat"
 
     scripted = tmp_path / "student.pt"
-    # TinyUltraModel contains only scriptable modules.
     uio.save_student_torchscript(uio.UltralyticsStudent(yolo=y, torch_model=TinyUltraModel()), scripted)
     assert scripted.exists()
+
+
+def test_ultralytics_pruning_stage_updates_stats_and_detect_branches(monkeypatch):
+    uio, YOLO, TinyUltraModel, _store = _import_uio(monkeypatch)
+    y = YOLO("w")
+    student = uio.UltralyticsStudent(yolo=y, torch_model=y.model)
+    y._xtrim_all_stats = {"params_initial": {"total_params": 1000}}
+    calls = []
+
+    monkeypatch.setattr(uio, "structured_trim_yolo", lambda *_a, **kw: {"layers_pruned": 1, "targeted": bool(kw.get("target_out_channels"))})
+    monkeypatch.setattr(uio, "shrink_psa_family_blocks", lambda *_a, **_kw: {"blocks_shrunk": 1})
+    monkeypatch.setattr(uio, "collect_detect_head_hidden_channels", lambda _m: {"head": 8})
+    monkeypatch.setattr(uio, "shrink_detect_heads_to_targets", lambda *_a, **kw: calls.append(("targets", kw["target_hidden_channels"])) or {"heads_shrunk": 2})
+    monkeypatch.setattr(uio, "shrink_detect_heads", lambda *_a, **_kw: calls.append(("ratio", None)) or {"heads_shrunk": 3})
+
+    stats = uio.apply_ultralytics_pruning_stage(
+        student,
+        stage_prune_ratio=0.25,
+        model_cfg=ModelConfig(imgsz=8),
+        trim_cfg=TrimConfig(exclude_head=True, channel_round=4, min_channels=4),
+        stage_label="s1",
+    )
+    assert stats["layers_pruned"] == 1
+    assert stats["compression_ratio_total"] > 0
+    assert y._xtrim_all_stats["s1_detect_head"]["skipped"] == "trim.exclude_head=true"
+    assert y.model is student.torch_model
+
+    stats = uio.apply_ultralytics_pruning_stage(
+        student,
+        stage_prune_ratio=0.2,
+        model_cfg=ModelConfig(imgsz=8),
+        trim_cfg=TrimConfig(exclude_head=False, channel_round=4, min_channels=4),
+        stage_label="s2",
+        target_architecture={"conv_out_channels": {"model.0": 4}, "detect_hidden_channels": {"head": 8}},
+    )
+    assert stats["target_architecture_applied"] is True
+    assert calls[-1] == ("targets", {"head": 8})
+
+    uio.apply_ultralytics_pruning_stage(
+        student,
+        stage_prune_ratio=0.2,
+        model_cfg=ModelConfig(imgsz=8),
+        trim_cfg=TrimConfig(exclude_head=False, channel_round=4, min_channels=4),
+        stage_label="s3",
+    )
+    assert calls[-1] == ("ratio", None)
+
+    with pytest.raises(ValueError, match="stage_prune_ratio"):
+        uio.apply_ultralytics_pruning_stage(student, stage_prune_ratio=1.0, model_cfg=ModelConfig(imgsz=8), trim_cfg=TrimConfig(), stage_label="bad")
+    with pytest.raises(TypeError, match="include_inner_m_regex"):
+        uio.apply_ultralytics_pruning_stage(
+            student,
+            stage_prune_ratio=0.2,
+            model_cfg=ModelConfig(imgsz=8),
+            trim_cfg=TrimConfig(include_inner_m_regex=123),
+            stage_label="bad2",
+        )
+
+
+def test_ultralytics_tflite_int8_export_selects_int8_and_optional_fp16(monkeypatch, tmp_path):
+    uio, YOLO, TinyUltraModel, _store = _import_uio(monkeypatch)
+    save_calls = []
+    export_calls = []
+
+    class SavingYolo(YOLO):
+        def save(self, path):
+            save_calls.append(path)
+            Path(path).write_bytes(b"checkpoint")
+
+    class ExportYolo:
+        def __init__(self, weights):
+            self.weights = weights
+
+        def export(self, **kwargs):
+            export_calls.append(kwargs)
+            Path("nested").mkdir(exist_ok=True)
+            Path("nested" / Path("model_float16.tflite")).write_bytes(b"fp16")
+            Path("model_full_integer_quant.tflite").write_bytes(b"bad_full_integer_quant")
+            Path("model_int8.tflite").write_bytes(b"good_int8")
+            Path("model_integer_quant.tflite").write_bytes(b"bad_integer_quant")
+            Path("model_float32.tflite").write_bytes(b"fp32")
+            return "model_float32.tflite"
+
+    sys.modules["ultralytics"].YOLO = ExportYolo
+    y = SavingYolo("w")
+    student = uio.UltralyticsStudent(yolo=y, torch_model=y.model)
+    export = uio.make_ultralytics_export_tflite_int8_fn(
+        student,
+        ModelConfig(imgsz=8, data="data.yaml"),
+        ExportConfig(tflite_fp16=True, tflite_fp16_name="gpu_fp16.tflite", tflite_int8_device="cpu", tflite_int8_simplify=True),
+    )
+
+    out = tmp_path / "model_int8.tflite"
+    assert export(out) == out
+    assert out.read_bytes() == b"good_int8"
+    assert (tmp_path / "gpu_fp16.tflite").read_bytes() == b"fp16"
+    assert save_calls and save_calls[0].endswith("xtrim_tflite_export.pt")
+    assert export_calls[0]["format"] == "tflite"
+    assert export_calls[0]["int8"] is True
+    assert export_calls[0]["device"] == "cpu"
+    assert export_calls[0]["simplify"] is True
+
+
+def test_ultralytics_tflite_int8_export_error_paths(monkeypatch, tmp_path):
+    uio, YOLO, _TinyUltraModel, _store = _import_uio(monkeypatch)
+
+    class SavingYolo(YOLO):
+        def save(self, path):
+            Path(path).write_bytes(b"checkpoint")
+
+    class NoFileYolo:
+        def __init__(self, weights):
+            self.weights = weights
+
+        def export(self, **_kwargs):
+            return None
+
+    sys.modules["ultralytics"].YOLO = NoFileYolo
+    student = uio.UltralyticsStudent(yolo=SavingYolo("w"), torch_model=SavingYolo("w").model)
+    export = uio.make_ultralytics_export_tflite_int8_fn(student, ModelConfig(imgsz=8), ExportConfig())
+    with pytest.raises(RuntimeError, match="no .tflite file"):
+        export(tmp_path / "missing.tflite")
+
+    class SaveFails(YOLO):
+        def save(self, path):
+            raise OSError("disk")
+
+    export = uio.make_ultralytics_export_tflite_int8_fn(
+        uio.UltralyticsStudent(yolo=SaveFails("w"), torch_model=SaveFails("w").model),
+        ModelConfig(imgsz=8),
+        ExportConfig(),
+    )
+    with pytest.raises(RuntimeError, match="Could not save temporary"):
+        export(tmp_path / "save_fail.tflite")
+
+    class SavesNothing(YOLO):
+        def save(self, path):
+            pass
+
+    export = uio.make_ultralytics_export_tflite_int8_fn(
+        uio.UltralyticsStudent(yolo=SavesNothing("w"), torch_model=SavesNothing("w").model),
+        ModelConfig(imgsz=8),
+        ExportConfig(),
+    )
+    with pytest.raises(RuntimeError, match="Temporary YOLO checkpoint was not created"):
+        export(tmp_path / "not_created.tflite")

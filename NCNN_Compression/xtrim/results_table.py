@@ -103,8 +103,6 @@ def _deploy_acc(h: HistoryItem) -> float:
 
 
 def _deploy_metric(h: HistoryItem, name: str) -> Optional[float]:
-    # Prefer explicitly selected deploy-artifact metrics stored in extra. Fall
-    # back to Metrics fields for backward/forward JSONL compatibility.
     value = _as_float(h.extra.get(f"{name}_deploy"))
     if value is not None:
         return value
@@ -112,11 +110,7 @@ def _deploy_metric(h: HistoryItem, name: str) -> Optional[float]:
 
 
 def _baseline_metric(history: List[HistoryItem], name: str) -> Optional[float]:
-    """Return an auxiliary metric for the initial raw/baseline model.
-
-    New histories contain a dedicated reference baseline item. For older
-    histories, fall back to an exact uncompressed candidate when present.
-    """
+    """Возвращает дополнительную метрику исходной модели."""
     ref = _reference_baseline(history)
     if ref is not None:
         return _deploy_metric(ref, name)
@@ -144,13 +138,7 @@ def _fmt_latency(value: object) -> str:
 
 
 def _latency_extra_keys(history: List[HistoryItem]) -> List[str]:
-    """Return latency keys for optional per-profile/per-device columns.
-
-    The regular Lat (ms) column is still the aggregate value. Extra latency
-    columns are useful when benchmark_profiles are enabled and latency_ms keys
-    look like "profile/device". For a single key, the aggregate column is
-    enough, so no extra latency column is produced.
-    """
+    """Находит дополнительные столбцы задержки для профилей вида profile/device."""
     keys: List[str] = []
     seen: Set[str] = set()
     for h in history:

@@ -1,4 +1,4 @@
-"""Standalone viewer: prints the results table from an existing history.jsonl."""
+"""Печатает таблицу результатов из готового history.jsonl."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ def main() -> int:
     ap.add_argument(
         "--history",
         type=str,
-        default="outputs/yolo8_30x_new_metrics_poco_gpu/history.jsonl",
+        default="outputs/yolov8m_tflite/history.jsonl",
         help="Path to history.jsonl",
     )
     ap.add_argument(

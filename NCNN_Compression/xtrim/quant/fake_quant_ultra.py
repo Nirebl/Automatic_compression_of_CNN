@@ -89,29 +89,19 @@ def set_fake_quant_bits(model: torch.nn.Module, bits_w: int = 8, bits_a: int = 8
             m._xtrim_fq_bits_a = int(bits_a)
 
 def unpatch_ultralytics_convs_for_fake_quant(model: torch.nn.Module) -> int:
-    """Restore Ultralytics Conv modules patched for fake quantization.
+    """Возвращает Conv-модули Ultralytics в обычное состояние после fake quantization.
 
-    QAT in this project monkey-patches ``Conv.forward`` at runtime. That is
-    fine for training and direct ONNX export, but saving the whole Ultralytics
-    model afterwards can serialize the dynamic bound method. When the checkpoint
-    is reloaded for TFLite export, Ultralytics/PyTorch may then try to resolve a
-    non-existent ``Conv._forward`` attribute. Restoring class-level ``forward``
-    before saving makes the temporary checkpoint portable again.
+    Это нужно перед сохранением временного checkpoint, чтобы экспорт не зависел от подмененного forward().
     """
     restored = 0
     for _, m in model.named_modules():
         if not (hasattr(m, "_xtrim_fq_patched") and getattr(m, "_xtrim_fq_patched")):
             continue
 
-        # Remove the instance-level forward method installed by
-        # patch_ultralytics_convs_for_fake_quant(). This lets Python fall back to
-        # the original class method ultralytics.nn.modules.Conv.forward.
         if "forward" in getattr(m, "__dict__", {}):
             try:
                 delattr(m, "forward")
             except Exception:
-                # As a fallback, restore the saved bound original method. The
-                # preferred path above avoids serializing any dynamic method.
                 if hasattr(m, "_xtrim_orig_forward"):
                     try:
                         m.forward = m._xtrim_orig_forward

@@ -53,8 +53,6 @@ class AndroidOrtBench:
 
         self.adb(device.serial, "push", str(local_image_list), remote_image_list)
         try:
-            # Directory must stay executable/traversable for the Android app.
-            # chmod -R 644 would make the directory unreadable as a directory.
             self.adb(device.serial, "shell", f"chmod 755 {remote_images_dir} && chmod 644 {remote_images_dir}/*")
         except Exception:
             pass

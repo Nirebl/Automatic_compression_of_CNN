@@ -1,9 +1,4 @@
-"""YOLO-specific integration helpers.
-
-Heavy Ultralytics imports are loaded lazily so pruning helper modules can be imported
-without requiring the full Ultralytics runtime at package-import time.
-"""
-
+"""Вспомогательные функции для интеграции YOLO в конвейер xtrim."""
 __all__ = [
     "build_ultralytics_candidate",
     "eval_ultralytics_map",

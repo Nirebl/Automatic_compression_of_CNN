@@ -18,6 +18,7 @@ from xtrim.yolo.ultralytics_io import (
     eval_exported_onnx_map,
     eval_exported_onnx_metrics,
     make_ultralytics_export_onnx_fn,
+    make_ultralytics_export_tflite_fp32_fn,
     make_ultralytics_export_tflite_int8_fn,
     save_student_torchscript,
     warmstart_noop,
@@ -33,7 +34,6 @@ def _copy_onnx_metadata(src: Path, dst: Path) -> None:
     import onnx
     srcm = onnx.load(str(src))
     dstm = onnx.load(str(dst))
-    # очистить и скопировать
     del dstm.metadata_props[:]
     for p in srcm.metadata_props:
         dstm.metadata_props.append(p)
@@ -117,6 +117,9 @@ def main() -> int:
     def export_factory(student, export_cfg_):
         return make_ultralytics_export_onnx_fn(student, model_cfg, export_cfg_)
 
+    def export_tflite_fp32_factory(student, export_cfg_):
+        return make_ultralytics_export_tflite_fp32_fn(student, model_cfg, export_cfg_)
+
     def export_tflite_int8_factory(student, export_cfg_):
         return make_ultralytics_export_tflite_int8_fn(student, model_cfg, export_cfg_)
 
@@ -157,7 +160,6 @@ def main() -> int:
             seed=int(train_cfg.seed),
         )
 
-        # 1) делаем INT8 ONNX
         out_path = ort_static_quantize_yolo(
             onnx_fp32=onnx_fp32,
             onnx_int8=onnx_int8,
@@ -170,7 +172,6 @@ def main() -> int:
             calibrate_method=str(onnx_ptq_cfg.calibrate_method),
         )
 
-        # 2) копируем metadata (stride/task/names/imgsz) из FP32 -> INT8
         try:
             _copy_onnx_metadata(onnx_fp32, out_path)
         except Exception:
@@ -203,6 +204,7 @@ def main() -> int:
         eval_metrics_fn=eval_student_metrics,
         export_onnx_fn_factory=export_factory,
         export_tflite_int8_fn_factory=export_tflite_int8_factory,
+        export_tflite_fp32_fn_factory=export_tflite_fp32_factory,
         eval_exported_onnx_fn=eval_onnx,
         eval_exported_onnx_metrics_fn=eval_onnx_metrics,
         quantize_onnx_fn=quantize_onnx_fn,
