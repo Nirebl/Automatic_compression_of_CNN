@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center"
+    android:background="#0f0e17"
+    android:padding="32dp">
+
+    <!-- App Icon / Logo area -->
+    <ImageView
+        android:layout_width="120dp"
+        android:layout_height="120dp"
+        android:src="@android:drawable/ic_menu_camera"
+        android:layout_marginBottom="24dp"
+        android:background="@drawable/circle_accent"
+        android:padding="28dp" />
+
+    <!-- Title -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="TestYOLO"
+        android:textColor="#fffffe"
+        android:textSize="36sp"
+        android:textStyle="bold"
+        android:fontFamily="sans-serif-medium"
+        android:layout_marginBottom="8dp" />
+
+    <!-- Subtitle -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="CNN Inference on Mobile"
+        android:textColor="#a7a9be"
+        android:textSize="16sp"
+        android:layout_marginBottom="48dp" />
+
+    <!-- Camera Button -->
+    <Button
+        android:id="@+id/btnCamera"
+        android:layout_width="280dp"
+        android:layout_height="64dp"
+        android:text="📷  Camera"
+        android:textColor="#0f0e17"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textAllCaps="false"
+        android:backgroundTint="#ff8906"
+        android:layout_marginBottom="16dp" />
+
+    <!-- Benchmark Button -->
+    <Button
+        android:id="@+id/btnBenchmark"
+        android:layout_width="280dp"
+        android:layout_height="64dp"
+        android:text="⚡  Benchmark"
+        android:textColor="#fffffe"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:textAllCaps="false"
+        android:backgroundTint="#e53170"
+        android:layout_marginBottom="48dp" />
+
+    <!-- Footer info -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="YOLOv8 • YOLOv11-seg • ResNet-50"
+        android:textColor="#a7a9be"
+        android:textSize="12sp"
+        android:layout_marginTop="24dp" />
+
+</LinearLayout>
+
