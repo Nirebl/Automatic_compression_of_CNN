@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:layout_marginBottom="8dp"
+    android:background="@drawable/card_background">
+
+    <!-- Top Row: Resolution and FPS -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <!-- Resolution Badge -->
+        <TextView
+            android:id="@+id/tvResolution"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="640"
+            android:textColor="#ff8906"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:minWidth="56dp"
+            android:paddingEnd="12dp" />
+
+        <!-- FPS Bar -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <ProgressBar
+                android:id="@+id/progressFps"
+                style="@style/Widget.AppCompat.ProgressBar.Horizontal"
+                android:layout_width="match_parent"
+                android:layout_height="12dp"
+                android:max="100"
+                android:progress="50"
+                android:progressTint="#00d26a"
+                android:progressBackgroundTint="#2e2f3e" />
+        </LinearLayout>
+
+        <!-- FPS Value -->
+        <TextView
+            android:id="@+id/tvFps"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="15.2 FPS"
+            android:textColor="#00d26a"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:paddingStart="12dp"
+            android:minWidth="80dp"
+            android:gravity="end" />
+    </LinearLayout>
+
+    <!-- Bottom Row: Latency and Details -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="8dp"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/tvLatency"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="65.8 ms"
+            android:textColor="#fffffe"
+            android:textSize="14sp"
+            android:background="#2e2f3e"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="4dp" />
+
+        <TextView
+            android:id="@+id/tvDetails"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="min: 60ms | max: 75ms | ~12 det"
+            android:textColor="#a7a9be"
+            android:textSize="12sp"
+            android:paddingStart="12dp"
+            android:gravity="end" />
+    </LinearLayout>
+
+</LinearLayout>
+

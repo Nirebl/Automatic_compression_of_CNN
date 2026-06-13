@@ -183,7 +183,6 @@ class SearchPolicy:
         return cls(cfg=cfg, space=space, rng=random.Random(int(cfg.seed)))
 
     def next_candidate(self, history: List[HistoryItem]) -> Optional[CandidateConfig]:
-        # reference baseline не должен считаться кандидатом поиска
         search_history = [h for h in history if not h.extra.get("is_reference_baseline", False)]
 
         all_cands = _all_candidates(self.space)

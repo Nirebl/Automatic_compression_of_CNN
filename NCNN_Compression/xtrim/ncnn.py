@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from .types import ToolsConfig, DeviceConfig, PTQConfig, NcnnModelPaths
+from .runtime_backend import effective_ncnn_gpu_device
 from .utils import sh, ensure_dir
 
 
@@ -231,9 +232,10 @@ class AdbBench:
         self.adb(device.serial, "push", str(ncnn.param), "/data/local/tmp/model.param")
         self.adb(device.serial, "push", str(ncnn.bin), "/data/local/tmp/model.bin")
 
+        gpu_device = effective_ncnn_gpu_device(device)
         cmd = (
             "cd /data/local/tmp && "
-            f"./benchncnn {device.loops} {device.threads} {device.powersave} {device.gpu_device} "
+            f"./benchncnn {device.loops} {device.threads} {device.powersave} {gpu_device} "
             f"{device.cooling_down} param=model.param bin=model.bin shape={shape}"
         )
         log = self.adb(device.serial, "shell", cmd)

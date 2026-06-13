@@ -87,3 +87,39 @@ def set_fake_quant_bits(model: torch.nn.Module, bits_w: int = 8, bits_a: int = 8
         if hasattr(m, "_xtrim_fq_patched") and getattr(m, "_xtrim_fq_patched"):
             m._xtrim_fq_bits_w = int(bits_w)
             m._xtrim_fq_bits_a = int(bits_a)
+
+def unpatch_ultralytics_convs_for_fake_quant(model: torch.nn.Module) -> int:
+    """Возвращает Conv-модули Ultralytics в обычное состояние после fake quantization.
+
+    Это нужно перед сохранением временного checkpoint, чтобы экспорт не зависел от подмененного forward().
+    """
+    restored = 0
+    for _, m in model.named_modules():
+        if not (hasattr(m, "_xtrim_fq_patched") and getattr(m, "_xtrim_fq_patched")):
+            continue
+
+        if "forward" in getattr(m, "__dict__", {}):
+            try:
+                delattr(m, "forward")
+            except Exception:
+                if hasattr(m, "_xtrim_orig_forward"):
+                    try:
+                        m.forward = m._xtrim_orig_forward
+                    except Exception:
+                        pass
+
+        for attr in (
+            "_xtrim_orig_forward",
+            "_xtrim_fq_patched",
+            "_xtrim_fq_enabled",
+            "_xtrim_fq_bits_w",
+            "_xtrim_fq_bits_a",
+        ):
+            if hasattr(m, attr):
+                try:
+                    delattr(m, attr)
+                except Exception:
+                    pass
+        restored += 1
+    return restored
+
